@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "interpreter-openai"
+version = "0.1.0"
+description = "Local macOS CLI English-to-Mandarin interpreter built with OpenAI APIs"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "numpy>=2.0.0,<3",
+  "openai>=1.100.0,<2",
+  "soundcard>=0.4.5,<0.5",
+  "websockets>=15.0,<16",
+]
+
+[project.scripts]
+interpreter-openai = "interpreter_openai.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
