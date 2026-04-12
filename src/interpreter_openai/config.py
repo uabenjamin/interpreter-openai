@@ -18,6 +18,12 @@ class AppConfig:
     source_language: str
     target_language_label: str
     transcription_model: str
+    turn_detection_type: str
+    semantic_vad_eagerness: str
+    max_turn_ms: int
+    translation_buffer_silence_ms: int
+    translation_buffer_max_ms: int
+    translation_min_words: int
     translation_model: str
     translation_max_output_tokens: int
     tts_model: str
@@ -93,6 +99,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="Realtime transcription model.",
     )
     parser.add_argument(
+        "--turn-detection-type",
+        default=os.getenv("INTERPRETER_OPENAI_TURN_DETECTION_TYPE", "semantic_vad"),
+        choices=("server_vad", "semantic_vad"),
+        help=(
+            "OpenAI Realtime turn detection mode. semantic_vad is usually better "
+            "for fast, continuous speakers."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-vad-eagerness",
+        default=os.getenv("INTERPRETER_OPENAI_SEMANTIC_VAD_EAGERNESS", "low"),
+        choices=("low", "medium", "high", "auto"),
+        help=(
+            "How quickly semantic_vad closes turns. low keeps larger chunks and is "
+            "less likely to cut off fast speakers."
+        ),
+    )
+    parser.add_argument(
+        "--max-turn-ms",
+        type=int,
+        default=int(os.getenv("INTERPRETER_OPENAI_MAX_TURN_MS", "6000")),
+        help=(
+            "Force-commit a long speech turn after this many milliseconds to bound "
+            "translation delay. Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--translation-buffer-silence-ms",
+        type=int,
+        default=int(os.getenv("INTERPRETER_OPENAI_TRANSLATION_BUFFER_SILENCE_MS", "900")),
+        help=(
+            "Flush buffered finalized transcript fragments after this much idle time."
+        ),
+    )
+    parser.add_argument(
+        "--translation-buffer-max-ms",
+        type=int,
+        default=int(os.getenv("INTERPRETER_OPENAI_TRANSLATION_BUFFER_MAX_MS", "9000")),
+        help=(
+            "Flush buffered finalized transcript fragments after this much total age "
+            "even without punctuation."
+        ),
+    )
+    parser.add_argument(
+        "--translation-min-words",
+        type=int,
+        default=int(os.getenv("INTERPRETER_OPENAI_TRANSLATION_MIN_WORDS", "4")),
+        help=(
+            "Do not translate very short fragments unless punctuation or max buffer "
+            "age forces a flush."
+        ),
+    )
+    parser.add_argument(
         "--translation-model",
         default=os.getenv("INTERPRETER_OPENAI_TRANSLATION_MODEL", "gpt-4o"),
         help="Text model used for English-to-Mandarin translation.",
@@ -118,8 +177,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.getenv(
             "INTERPRETER_OPENAI_TTS_INSTRUCTIONS",
             (
-                "Speak natural, warm Mandarin suitable for live church interpretation. "
-                "Use a calm pace, gentle emphasis, and clear diction."
+                "Speak in consistent Mandarin using the same speaker identity on every "
+                "utterance. Keep the same timbre, persona, accent, pacing baseline, and "
+                "overall delivery from clip to clip. Do not roleplay, do not change "
+                "character, and do not vary age or personality. Use a calm, warm church "
+                "interpretation style with clear diction and restrained emphasis."
             ),
         ),
         help="Speech style instructions for the TTS model.",
@@ -215,6 +277,12 @@ def parse_args(argv: list[str] | None = None) -> AppConfig:
         source_language=args.source_language,
         target_language_label=args.target_language_label,
         transcription_model=args.transcription_model,
+        turn_detection_type=args.turn_detection_type,
+        semantic_vad_eagerness=args.semantic_vad_eagerness,
+        max_turn_ms=args.max_turn_ms,
+        translation_buffer_silence_ms=args.translation_buffer_silence_ms,
+        translation_buffer_max_ms=args.translation_buffer_max_ms,
+        translation_min_words=args.translation_min_words,
         translation_model=args.translation_model,
         translation_max_output_tokens=args.translation_max_output_tokens,
         tts_model=args.tts_model,

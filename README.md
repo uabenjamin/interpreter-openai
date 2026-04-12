@@ -93,6 +93,12 @@ If you lose track of a running instance, use:
 
 - Realtime transcription model: `gpt-4o-transcribe`
 - Realtime session model: `gpt-realtime`
+- Turn detection: `semantic_vad`
+- Semantic VAD eagerness: `low`
+- Max turn duration: `6000 ms`
+- Translation buffer silence: `900 ms`
+- Translation buffer max age: `9000 ms`
+- Translation minimum words: `4`
 - Translation model: `gpt-4o`
 - Translation max output tokens: `192`
 - TTS model: `gpt-4o-mini-tts`
@@ -103,14 +109,61 @@ If you lose track of a running instance, use:
 
 These are configurable with CLI flags.
 
+For fast speakers, the app now defaults to `semantic_vad` with low eagerness.
+OpenAI's current Realtime docs describe `semantic_vad` as less likely to chunk
+the transcript before the speaker is done, while `server_vad` chunks purely on
+periods of silence.
+
+To prevent a long sermon segment from sitting open for too long, the app also
+force-commits the current audio buffer after `6000 ms` of continuous speech by
+default. This bounds translation delay even when VAD is being conservative.
+
+Finalized English fragments are now buffered before translation. Instead of
+translating every committed fragment immediately, the app waits for sentence
+punctuation, a short idle gap, or a max buffer age, which produces more
+coherent Mandarin output when the speaker talks in long flowing clauses.
+
+If you want the older silence-based behavior, run:
+
+```bash
+.venv/bin/python -m interpreter_openai run \
+  --turn-detection-type server_vad \
+  --vad-threshold 0.35 \
+  --vad-prefix-padding-ms 500 \
+  --vad-silence-ms 800
+```
+
+If you want even faster translation handoff for live preaching, lower the cap:
+
+```bash
+.venv/bin/python -m interpreter_openai run --max-turn-ms 4000
+```
+
+If translation still feels too fragmentary, raise the buffer settings:
+
+```bash
+.venv/bin/python -m interpreter_openai run \
+  --translation-buffer-silence-ms 1200 \
+  --translation-buffer-max-ms 12000
+```
+
 Important: the Realtime WebSocket session model and the transcription model are
 not the same thing in this app. The WebSocket connects with a realtime model
 such as `gpt-realtime`, and the session then enables input transcription with
 `gpt-4o-transcribe`.
 
+Note: OpenAI's docs currently list `gpt-4o-transcribe-latest` as a supported
+Realtime transcription model, but this project defaults to `gpt-4o-transcribe`
+because some live endpoints currently reject the `-latest` alias.
+
 The playback path now starts speaking as TTS audio bytes arrive instead of
 waiting for the full clip to download first. This lowers perceived latency even
 if total synthesis time is still around one second.
+
+The app already pins a single named TTS voice on every request. To reduce
+occasional drift in delivery, the default TTS instructions also tell the model
+to keep the same speaker identity, timbre, persona, and pacing from clip to
+clip.
 
 ## Sermon-specific translation quality
 

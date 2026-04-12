@@ -31,6 +31,9 @@ class OpenAIRealtimeTranscriber:
             project=config.openai_project,
         )
         self._commit_counter = 0
+        self._speech_active = False
+        self._turn_started_at: float | None = None
+        self._manual_commit_pending = False
 
     async def stream_audio(
         self,
@@ -38,6 +41,9 @@ class OpenAIRealtimeTranscriber:
         transcript_queue: asyncio.Queue[TranscriptUpdate],
         ready_event: asyncio.Event,
     ) -> None:
+        self._speech_active = False
+        self._turn_started_at = None
+        self._manual_commit_pending = False
         async with self._client.beta.realtime.connect(
             model=self._config.realtime_session_model,
             websocket_connection_options={
@@ -51,9 +57,12 @@ class OpenAIRealtimeTranscriber:
                 self._receive_events(connection, transcript_queue, ready_event)
             )
             sender = asyncio.create_task(self._send_audio(connection, audio_source))
+            tasks = {receiver, sender}
+            if self._config.max_turn_ms > 0:
+                tasks.add(asyncio.create_task(self._force_commit_long_turns(connection)))
 
             done, pending = await asyncio.wait(
-                {receiver, sender},
+                tasks,
                 return_when=asyncio.FIRST_EXCEPTION,
             )
             for task in pending:
@@ -97,24 +106,35 @@ class OpenAIRealtimeTranscriber:
                 "language": self._config.source_language,
                 "prompt": (
                     "Transcribe spoken English clearly. Keep scripture references, "
-                    "proper names, and church terminology accurate."
+                    "proper names, and church terminology accurate. Prefer complete "
+                    "phrases over isolated words when speech is continuous."
                 ),
             },
             "modalities": ["text"],
-            "turn_detection": {
-                "type": "server_vad",
-                "threshold": self._config.vad_threshold,
-                "prefix_padding_ms": self._config.vad_prefix_padding_ms,
-                "silence_duration_ms": self._config.vad_silence_ms,
-                "create_response": False,
-                "interrupt_response": False,
-            },
+            "turn_detection": self._build_turn_detection(),
         }
         if self._config.noise_reduction_mode is not None:
             session["input_audio_noise_reduction"] = {
                 "type": self._config.noise_reduction_mode
             }
         return session
+
+    def _build_turn_detection(self) -> dict[str, object]:
+        if self._config.turn_detection_type == "semantic_vad":
+            return {
+                "type": "semantic_vad",
+                "eagerness": self._config.semantic_vad_eagerness,
+                "create_response": False,
+                "interrupt_response": False,
+            }
+        return {
+            "type": "server_vad",
+            "threshold": self._config.vad_threshold,
+            "prefix_padding_ms": self._config.vad_prefix_padding_ms,
+            "silence_duration_ms": self._config.vad_silence_ms,
+            "create_response": False,
+            "interrupt_response": False,
+        }
 
     async def _send_audio(
         self,
@@ -155,10 +175,15 @@ class OpenAIRealtimeTranscriber:
                 continue
 
             if event_type == "input_audio_buffer.speech_started":
+                self._speech_active = True
+                if self._turn_started_at is None:
+                    self._turn_started_at = asyncio.get_running_loop().time()
                 LOGGER.info("Speech detected.")
                 continue
 
             if event_type == "input_audio_buffer.speech_stopped":
+                self._speech_active = False
+                self._turn_started_at = None
                 LOGGER.info("Speech ended. Waiting for transcription.")
                 continue
 
@@ -167,6 +192,10 @@ class OpenAIRealtimeTranscriber:
                 if not item_id:
                     continue
                 previous_item_id = getattr(event, "previous_item_id", None)
+                self._manual_commit_pending = False
+                self._turn_started_at = (
+                    asyncio.get_running_loop().time() if self._speech_active else None
+                )
                 LOGGER.info("Audio turn committed.")
                 pending_commits[item_id] = (
                     str(previous_item_id) if previous_item_id is not None else None
@@ -228,7 +257,41 @@ class OpenAIRealtimeTranscriber:
                 continue
 
             if event_type == "error":
+                if self._is_benign_empty_buffer_commit_error(event):
+                    self._manual_commit_pending = False
+                    LOGGER.debug(
+                        "Ignoring empty audio buffer commit race while forcing a long turn."
+                    )
+                    continue
                 raise UserFacingError(self._format_error_event(event))
+
+    async def _force_commit_long_turns(self, connection) -> None:
+        while True:
+            await asyncio.sleep(0.2)
+            if not self._speech_active:
+                continue
+            if self._manual_commit_pending:
+                continue
+            if self._turn_started_at is None:
+                self._turn_started_at = asyncio.get_running_loop().time()
+                continue
+
+            elapsed_ms = (
+                asyncio.get_running_loop().time() - self._turn_started_at
+            ) * 1000
+            if elapsed_ms < self._config.max_turn_ms:
+                continue
+
+            self._manual_commit_pending = True
+            LOGGER.info(
+                "Forcing audio commit after %.1fs of continuous speech.",
+                elapsed_ms / 1000,
+            )
+            try:
+                await connection.input_audio_buffer.commit()
+            except Exception:
+                self._manual_commit_pending = False
+                raise
 
     async def _emit_ready_completed(
         self,
@@ -273,3 +336,18 @@ class OpenAIRealtimeTranscriber:
         if message:
             return f"OpenAI realtime error: {message}"
         return f"OpenAI realtime error: {event}"
+
+    def _is_benign_empty_buffer_commit_error(self, event) -> bool:
+        error = getattr(event, "error", None)
+        if error is None:
+            return False
+        message = str(getattr(error, "message", "") or "").lower()
+        code = str(getattr(error, "code", "") or "").lower()
+        return (
+            "input audio buffer is empty" in message
+            or (
+                "input audio buffer" in message
+                and "empty" in message
+            )
+            or code == "input_audio_buffer_empty"
+        )

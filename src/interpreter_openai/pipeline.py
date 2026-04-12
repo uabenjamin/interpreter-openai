@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -70,6 +71,22 @@ class InterpreterApp:
             "Realtime session model: %s | transcription model: %s",
             self._config.realtime_session_model,
             self._config.transcription_model,
+        )
+        LOGGER.info(
+            "Turn detection: %s%s",
+            self._config.turn_detection_type,
+            (
+                f" ({self._config.semantic_vad_eagerness})"
+                if self._config.turn_detection_type == "semantic_vad"
+                else ""
+            ),
+        )
+        LOGGER.info("Max turn duration: %sms", self._config.max_turn_ms)
+        LOGGER.info(
+            "Translation buffer: silence=%sms max=%sms min_words=%s",
+            self._config.translation_buffer_silence_ms,
+            self._config.translation_buffer_max_ms,
+            self._config.translation_min_words,
         )
         LOGGER.info(
             "Listening continuously. Use Control-C to stop. Command-C usually "
@@ -152,6 +169,22 @@ class InterpreterApp:
             self._config.realtime_session_model,
             self._config.transcription_model,
         )
+        LOGGER.info(
+            "Turn detection: %s%s",
+            self._config.turn_detection_type,
+            (
+                f" ({self._config.semantic_vad_eagerness})"
+                if self._config.turn_detection_type == "semantic_vad"
+                else ""
+            ),
+        )
+        LOGGER.info("Max turn duration: %sms", self._config.max_turn_ms)
+        LOGGER.info(
+            "Translation buffer: silence=%sms max=%sms min_words=%s",
+            self._config.translation_buffer_silence_ms,
+            self._config.translation_buffer_max_ms,
+            self._config.translation_min_words,
+        )
         translator_probe = await verify_openai_text_generation(
             client,
             self._config.translation_model,
@@ -183,6 +216,37 @@ class InterpreterApp:
         last_partial_by_item: dict[str, str] = {}
         seen_completed_items: set[str] = set()
         next_sequence_id = 1
+        buffered_english = ""
+        buffer_started_at: float | None = None
+        buffer_last_updated_at: float | None = None
+
+        async def flush_buffered_english() -> None:
+            nonlocal buffered_english, buffer_started_at, buffer_last_updated_at, next_sequence_id
+
+            english_text = buffered_english.strip()
+            if not english_text:
+                buffered_english = ""
+                buffer_started_at = None
+                buffer_last_updated_at = None
+                return
+
+            if utterance_queue.qsize() >= 2:
+                LOGGER.warning(
+                    "Playback queue backlog is %s utterances. Mandarin audio may lag.",
+                    utterance_queue.qsize(),
+                )
+
+            LOGGER.info("[segment-en %s] %s", next_sequence_id, english_text)
+            await utterance_queue.put(
+                QueuedUtterance(
+                    sequence_id=next_sequence_id,
+                    english_text=english_text,
+                )
+            )
+            next_sequence_id += 1
+            buffered_english = ""
+            buffer_started_at = None
+            buffer_last_updated_at = None
 
         while True:
             if playback_task.done():
@@ -195,6 +259,14 @@ class InterpreterApp:
             try:
                 update = await asyncio.wait_for(transcript_queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
+                now = time.monotonic()
+                if self._should_flush_translation_buffer(
+                    buffered_english,
+                    buffer_started_at,
+                    buffer_last_updated_at,
+                    now,
+                ):
+                    await flush_buffered_english()
                 continue
 
             if update.is_partial:
@@ -212,20 +284,25 @@ class InterpreterApp:
             if not english_text:
                 continue
 
-            if utterance_queue.qsize() >= 2:
-                LOGGER.warning(
-                    "Playback queue backlog is %s utterances. Mandarin audio may lag.",
-                    utterance_queue.qsize(),
-                )
-
-            LOGGER.info("[segment-en %s] %s", next_sequence_id, english_text)
-            await utterance_queue.put(
-                QueuedUtterance(
-                    sequence_id=next_sequence_id,
-                    english_text=english_text,
-                )
+            now = time.monotonic()
+            normalized_fragment = self._normalize_transcript_fragment(english_text)
+            if not normalized_fragment:
+                continue
+            buffered_english = self._merge_transcript_fragments(
+                buffered_english,
+                normalized_fragment,
             )
-            next_sequence_id += 1
+            if buffer_started_at is None:
+                buffer_started_at = now
+            buffer_last_updated_at = now
+
+            if self._should_flush_translation_buffer(
+                buffered_english,
+                buffer_started_at,
+                buffer_last_updated_at,
+                now,
+            ):
+                await flush_buffered_english()
 
     async def _translation_playback_worker(
         self,
@@ -262,6 +339,71 @@ class InterpreterApp:
                 )
             finally:
                 utterance_queue.task_done()
+
+    def _normalize_transcript_fragment(self, text: str) -> str:
+        return " ".join(text.split()).strip()
+
+    def _merge_transcript_fragments(self, existing: str, fragment: str) -> str:
+        if not existing:
+            return fragment
+        if not fragment:
+            return existing
+
+        existing_lower = existing.lower()
+        fragment_lower = fragment.lower()
+        if existing_lower.endswith(fragment_lower):
+            return existing
+
+        max_overlap = min(len(existing), len(fragment))
+        for overlap in range(max_overlap, 0, -1):
+            if existing_lower.endswith(fragment_lower[:overlap]):
+                tail = fragment[overlap:]
+                if not tail:
+                    return existing
+                if tail[0] in " ,.!?;:)":
+                    return f"{existing}{tail}"
+                return f"{existing} {tail}"
+
+        if existing[-1] in " ([{" or fragment[0] in ",.!?;:)]}":
+            return f"{existing}{fragment}"
+        return f"{existing} {fragment}"
+
+    def _should_flush_translation_buffer(
+        self,
+        buffered_english: str,
+        buffer_started_at: float | None,
+        buffer_last_updated_at: float | None,
+        now: float,
+    ) -> bool:
+        text = buffered_english.strip()
+        if not text or buffer_started_at is None or buffer_last_updated_at is None:
+            return False
+
+        word_count = self._word_count(text)
+        idle_ms = (now - buffer_last_updated_at) * 1000
+        age_ms = (now - buffer_started_at) * 1000
+
+        if self._ends_with_sentence_punctuation(text):
+            return True
+        if (
+            word_count >= self._config.translation_min_words
+            and idle_ms >= self._config.translation_buffer_silence_ms
+        ):
+            return True
+        if (
+            word_count >= self._config.translation_min_words
+            and age_ms >= self._config.translation_buffer_max_ms
+        ):
+            return True
+        if idle_ms >= max(self._config.translation_buffer_silence_ms * 2, 1500):
+            return True
+        return False
+
+    def _ends_with_sentence_punctuation(self, text: str) -> bool:
+        return bool(re.search(r"[.!?。！？][\"')\]]*$", text)) or text.endswith("...")
+
+    def _word_count(self, text: str) -> int:
+        return len(re.findall(r"\b[\w']+\b", text))
 
     async def _wait_for_stream_ready(
         self,
