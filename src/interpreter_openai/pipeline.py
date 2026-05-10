@@ -13,6 +13,7 @@ from .audio_io import (
     AudioUnavailableError,
     MicrophoneCapture,
     SpeakerPlayback,
+    SpeechFilterConfig,
     get_default_microphone_name,
     get_default_speaker_name,
     get_selected_microphone_name,
@@ -133,6 +134,7 @@ class InterpreterApp:
             self._config.translation_buffer_max_ms,
             self._config.translation_min_words,
         )
+        LOGGER.info("Speech filter: %s", self._config.speech_filter_mode)
         LOGGER.info("TTS: %s", "enabled" if self._config.enable_tts else "disabled")
         LOGGER.info(
             "Listening continuously. Use Control-C to stop. Command-C usually "
@@ -153,6 +155,14 @@ class InterpreterApp:
             capture_sample_rate_hz=self._config.capture_sample_rate_hz,
             output_sample_rate_hz=self._config.sample_rate_hz,
             capture_chunk_frames=self._config.capture_chunk_frames,
+            speech_filter_config=SpeechFilterConfig(
+                mode=self._config.speech_filter_mode,
+                sample_rate_hz=self._config.sample_rate_hz,
+                highpass_hz=self._config.speech_filter_highpass_hz,
+                lowpass_hz=self._config.speech_filter_lowpass_hz,
+                gate_threshold=self._config.speech_filter_gate_threshold,
+                gate_floor=self._config.speech_filter_gate_floor,
+            ),
         )
 
         async def audio_source() -> AsyncIterator[bytes]:
@@ -240,6 +250,7 @@ class InterpreterApp:
             self._config.translation_buffer_max_ms,
             self._config.translation_min_words,
         )
+        LOGGER.info("Speech filter: %s", self._config.speech_filter_mode)
         LOGGER.info("TTS: %s", "enabled" if self._config.enable_tts else "disabled")
         translator_probe = await verify_openai_text_generation(
             client,

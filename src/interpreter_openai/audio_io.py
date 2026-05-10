@@ -31,6 +31,86 @@ class AudioUnavailableError(RuntimeError):
     """Raised when no usable default audio device is available."""
 
 
+@dataclass(slots=True)
+class SpeechFilterConfig:
+    mode: str
+    sample_rate_hz: int
+    highpass_hz: float
+    lowpass_hz: float
+    gate_threshold: float
+    gate_floor: float
+
+
+class SpeechAudioPreprocessor:
+    def __init__(self, config: SpeechFilterConfig) -> None:
+        self._config = config
+        self._enabled = config.mode == "voice_focus"
+        self._highpass_prev_x = 0.0
+        self._highpass_prev_y = 0.0
+        self._lowpass_prev_y = 0.0
+        self._smoothed_rms = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def process(self, data: np.ndarray) -> np.ndarray:
+        if not self._enabled or len(data) == 0:
+            return data
+        if data.ndim == 2 and data.shape[1] > 1:
+            data = data.mean(axis=1, keepdims=True)
+        if data.ndim == 1:
+            data = data.reshape(-1, 1)
+
+        samples = data[:, 0].astype(np.float32, copy=True)
+        band_limited = self._band_limit(samples)
+        gated = self._apply_gate(band_limited)
+        return gated.reshape(-1, 1)
+
+    def _band_limit(self, samples: np.ndarray) -> np.ndarray:
+        sample_rate = float(self._config.sample_rate_hz)
+        dt = 1.0 / sample_rate
+
+        hp_cutoff = max(20.0, min(self._config.highpass_hz, sample_rate / 3.0))
+        hp_rc = 1.0 / (2.0 * np.pi * hp_cutoff)
+        hp_alpha = hp_rc / (hp_rc + dt)
+
+        highpassed = np.empty_like(samples)
+        prev_x = self._highpass_prev_x
+        prev_y = self._highpass_prev_y
+        for index, x_value in enumerate(samples):
+            y_value = hp_alpha * (prev_y + float(x_value) - prev_x)
+            highpassed[index] = y_value
+            prev_x = float(x_value)
+            prev_y = y_value
+        self._highpass_prev_x = prev_x
+        self._highpass_prev_y = prev_y
+
+        lp_cutoff = max(hp_cutoff + 50.0, min(self._config.lowpass_hz, sample_rate / 2.2))
+        lp_rc = 1.0 / (2.0 * np.pi * lp_cutoff)
+        lp_alpha = dt / (lp_rc + dt)
+
+        lowpassed = np.empty_like(highpassed)
+        prev_y = self._lowpass_prev_y
+        for index, x_value in enumerate(highpassed):
+            prev_y = prev_y + lp_alpha * (float(x_value) - prev_y)
+            lowpassed[index] = prev_y
+        self._lowpass_prev_y = prev_y
+        return lowpassed
+
+    def _apply_gate(self, samples: np.ndarray) -> np.ndarray:
+        rms = float(np.sqrt(np.mean(np.square(samples), dtype=np.float64)))
+        self._smoothed_rms = (self._smoothed_rms * 0.85) + (rms * 0.15)
+        threshold = max(self._config.gate_threshold, 1e-5)
+        floor = float(np.clip(self._config.gate_floor, 0.0, 1.0))
+        if self._smoothed_rms >= threshold:
+            gain = 1.0
+        else:
+            ratio = max(0.0, min(self._smoothed_rms / threshold, 1.0))
+            gain = floor + ((1.0 - floor) * ratio)
+        return samples * gain
+
+
 def _all_microphones() -> list[object]:
     microphones = list(sc.all_microphones())
     if not microphones:
@@ -234,11 +314,17 @@ class MicrophoneCapture:
         capture_sample_rate_hz: int,
         output_sample_rate_hz: int,
         capture_chunk_frames: int,
+        speech_filter_config: SpeechFilterConfig | None = None,
     ) -> None:
         self._device_name = device_name
         self._capture_sample_rate_hz = capture_sample_rate_hz
         self._output_sample_rate_hz = output_sample_rate_hz
         self._capture_chunk_frames = capture_chunk_frames
+        self._speech_preprocessor = (
+            SpeechAudioPreprocessor(speech_filter_config)
+            if speech_filter_config is not None
+            else None
+        )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._queue: asyncio.Queue[bytes | None] | None = None
         self._started_event = asyncio.Event()
@@ -284,6 +370,14 @@ class MicrophoneCapture:
                 self._capture_sample_rate_hz,
                 self._output_sample_rate_hz,
             )
+            if self._speech_preprocessor is not None and self._speech_preprocessor.enabled:
+                LOGGER.info(
+                    "Applying local voice_focus filter: highpass=%sHz lowpass=%sHz gate=%.4f floor=%.2f",
+                    self._speech_preprocessor._config.highpass_hz,
+                    self._speech_preprocessor._config.lowpass_hz,
+                    self._speech_preprocessor._config.gate_threshold,
+                    self._speech_preprocessor._config.gate_floor,
+                )
             with microphone.recorder(
                 samplerate=self._capture_sample_rate_hz,
                 channels=1,
@@ -296,6 +390,8 @@ class MicrophoneCapture:
                         input_sample_rate_hz=self._capture_sample_rate_hz,
                         output_sample_rate_hz=self._output_sample_rate_hz,
                     )
+                    if self._speech_preprocessor is not None:
+                        frames = self._speech_preprocessor.process(frames)
                     chunk = float_audio_to_pcm16_bytes(frames)
                     self._loop.call_soon_threadsafe(self._queue_chunk, chunk)
         finally:

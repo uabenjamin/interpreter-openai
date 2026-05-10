@@ -53,6 +53,11 @@ class AppConfig:
     capture_sample_rate_hz: int
     sample_rate_hz: int
     chunk_duration_ms: int
+    speech_filter_mode: str
+    speech_filter_highpass_hz: float
+    speech_filter_lowpass_hz: float
+    speech_filter_gate_threshold: float
+    speech_filter_gate_floor: float
     vad_threshold: float
     vad_prefix_padding_ms: int
     vad_silence_ms: int
@@ -255,6 +260,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mic capture chunk size in milliseconds.",
     )
     parser.add_argument(
+        "--speech-filter-mode",
+        default=os.getenv("INTERPRETER_OPENAI_SPEECH_FILTER_MODE", "off"),
+        choices=("off", "voice_focus"),
+        help=(
+            "Optional local preprocessing before audio is sent to OpenAI. "
+            "voice_focus applies a speech-band filter plus a light gate."
+        ),
+    )
+    parser.add_argument(
+        "--speech-filter-highpass-hz",
+        type=float,
+        default=float(os.getenv("INTERPRETER_OPENAI_SPEECH_FILTER_HIGHPASS_HZ", "120")),
+        help="High-pass cutoff for the local voice_focus filter.",
+    )
+    parser.add_argument(
+        "--speech-filter-lowpass-hz",
+        type=float,
+        default=float(os.getenv("INTERPRETER_OPENAI_SPEECH_FILTER_LOWPASS_HZ", "3600")),
+        help="Low-pass cutoff for the local voice_focus filter.",
+    )
+    parser.add_argument(
+        "--speech-filter-gate-threshold",
+        type=float,
+        default=float(os.getenv("INTERPRETER_OPENAI_SPEECH_FILTER_GATE_THRESHOLD", "0.015")),
+        help="RMS threshold for the local voice_focus gate.",
+    )
+    parser.add_argument(
+        "--speech-filter-gate-floor",
+        type=float,
+        default=float(os.getenv("INTERPRETER_OPENAI_SPEECH_FILTER_GATE_FLOOR", "0.15")),
+        help="Residual gain floor when the local voice_focus gate attenuates audio.",
+    )
+    parser.add_argument(
         "--vad-threshold",
         type=float,
         default=float(os.getenv("INTERPRETER_OPENAI_VAD_THRESHOLD", "0.5")),
@@ -342,6 +380,11 @@ def parse_args(argv: list[str] | None = None) -> AppConfig:
         capture_sample_rate_hz=args.capture_sample_rate_hz,
         sample_rate_hz=args.sample_rate_hz,
         chunk_duration_ms=args.chunk_duration_ms,
+        speech_filter_mode=args.speech_filter_mode,
+        speech_filter_highpass_hz=args.speech_filter_highpass_hz,
+        speech_filter_lowpass_hz=args.speech_filter_lowpass_hz,
+        speech_filter_gate_threshold=args.speech_filter_gate_threshold,
+        speech_filter_gate_floor=args.speech_filter_gate_floor,
         vad_threshold=args.vad_threshold,
         vad_prefix_padding_ms=args.vad_prefix_padding_ms,
         vad_silence_ms=args.vad_silence_ms,

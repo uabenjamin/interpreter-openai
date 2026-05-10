@@ -121,6 +121,20 @@ If you also want translated speech to go back out through the interface:
   --enable-tts
 ```
 
+If the incoming feed contains some background bed or room rumble, you can also
+enable a local speech-focused prefilter before audio is sent to OpenAI:
+
+```bash
+.venv/bin/python -m interpreter_openai run \
+  --input-device Maono \
+  --speech-filter-mode voice_focus
+```
+
+This is a limited mitigation, not true source separation. If speech and music
+are already mixed together on the same bus, no simple filter can fully remove
+the music. The best live setup is a dedicated mixer send that contains the
+pastor mic and excludes the music channels.
+
 To stop it from the terminal, use `Control-C`.
 
 On macOS terminals, `Command-C` usually copies text and does not interrupt the
@@ -154,6 +168,7 @@ If you lose track of a running instance, use:
 - TTS speed: `1.15`
 - OpenAI audio format: `24 kHz` mono PCM
 - Local microphone capture: `16 kHz`, resampled to `24 kHz`
+- Local speech filter: `off`
 
 These are configurable with CLI flags.
 
@@ -212,6 +227,11 @@ The app already pins a single named TTS voice on every request. To reduce
 occasional drift in delivery, the default TTS instructions also tell the model
 to keep the same speaker identity, timbre, persona, and pacing from clip to
 clip.
+
+The Realtime session also supports OpenAI-side input noise reduction through
+`input_audio_noise_reduction`, and this project passes that setting through as
+`near_field`, `far_field`, or `none`. That helps with general noise, but it is
+not a vocal-isolation feature.
 
 ## Sermon-specific translation quality
 
