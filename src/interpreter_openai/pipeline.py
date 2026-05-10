@@ -9,7 +9,17 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
-from .audio_io import AudioUnavailableError, MicrophoneCapture, SpeakerPlayback, get_default_devices
+from .audio_io import (
+    AudioUnavailableError,
+    MicrophoneCapture,
+    SpeakerPlayback,
+    get_default_microphone_name,
+    get_default_speaker_name,
+    get_selected_microphone_name,
+    get_selected_speaker_name,
+    list_microphone_names,
+    list_speaker_names,
+)
 from .config import AppConfig
 from .error_handling import UserFacingError
 from .openai_clients import build_client, verify_openai_text_generation
@@ -21,6 +31,10 @@ from .translator import OpenAITranslator
 LOGGER = logging.getLogger(__name__)
 
 
+def _emit_console_line(label: str, sequence_id: int, text: str) -> None:
+    print(f"[{label} {sequence_id}] {text}", flush=True)
+
+
 @dataclass(slots=True)
 class QueuedUtterance:
     sequence_id: int
@@ -30,6 +44,25 @@ class QueuedUtterance:
 class InterpreterApp:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
+
+    async def list_devices(self) -> None:
+        print("Input devices:", flush=True)
+        try:
+            default_microphone = get_default_microphone_name()
+            for name in list_microphone_names():
+                marker = "*" if name == default_microphone else "-"
+                print(f"  {marker} {name}", flush=True)
+        except AudioUnavailableError as exc:
+            print(f"  unavailable: {exc}", flush=True)
+
+        print("Output devices:", flush=True)
+        try:
+            default_speaker = get_default_speaker_name()
+            for name in list_speaker_names():
+                marker = "*" if name == default_speaker else "-"
+                print(f"  {marker} {name}", flush=True)
+        except AudioUnavailableError as exc:
+            print(f"  unavailable: {exc}", flush=True)
 
     async def run(self) -> None:
         client = build_client(self._config)
@@ -48,25 +81,37 @@ class InterpreterApp:
             glossary_file=self._config.glossary_file,
             translation_notes_file=self._config.translation_notes_file,
         )
-        tts = OpenAITTSService(
-            client=client,
-            model=self._config.tts_model,
-            voice=self._config.tts_voice,
-            instructions=self._config.tts_instructions,
-            speed=self._config.tts_speed,
-            sample_rate_hz=self._config.sample_rate_hz,
-        )
         transcriber = OpenAIRealtimeTranscriber(self._config, api_key)
-        speaker = SpeakerPlayback(
-            sample_rate_hz=self._config.sample_rate_hz,
-            drain_ms=self._config.playback_drain_ms,
-            target_rms=self._config.playback_target_rms,
-            max_gain=self._config.playback_max_gain,
-        )
+        tts: OpenAITTSService | None = None
+        speaker: SpeakerPlayback | None = None
+        if self._config.enable_tts:
+            tts = OpenAITTSService(
+                client=client,
+                model=self._config.tts_model,
+                voice=self._config.tts_voice,
+                instructions=self._config.tts_instructions,
+                speed=self._config.tts_speed,
+                sample_rate_hz=self._config.sample_rate_hz,
+            )
+            speaker = SpeakerPlayback(
+                device_name=self._config.output_device,
+                sample_rate_hz=self._config.sample_rate_hz,
+                drain_ms=self._config.playback_drain_ms,
+                target_rms=self._config.playback_target_rms,
+                max_gain=self._config.playback_max_gain,
+            )
 
-        devices = get_default_devices()
-        LOGGER.info("Using microphone: %s", devices.default_microphone)
-        LOGGER.info("Using speaker: %s", devices.default_speaker)
+        try:
+            microphone_name = get_selected_microphone_name(self._config.input_device)
+        except AudioUnavailableError as exc:
+            raise UserFacingError(str(exc)) from exc
+        LOGGER.info("Using microphone: %s", microphone_name)
+        if self._config.enable_tts:
+            try:
+                speaker_name = get_selected_speaker_name(self._config.output_device)
+            except AudioUnavailableError as exc:
+                raise UserFacingError(str(exc)) from exc
+            LOGGER.info("Using speaker: %s", speaker_name)
         LOGGER.info(
             "Realtime session model: %s | transcription model: %s",
             self._config.realtime_session_model,
@@ -88,6 +133,7 @@ class InterpreterApp:
             self._config.translation_buffer_max_ms,
             self._config.translation_min_words,
         )
+        LOGGER.info("TTS: %s", "enabled" if self._config.enable_tts else "disabled")
         LOGGER.info(
             "Listening continuously. Use Control-C to stop. Command-C usually "
             "copies text and does not stop terminal apps on macOS."
@@ -103,6 +149,7 @@ class InterpreterApp:
         transcript_queue: asyncio.Queue[TranscriptUpdate] = asyncio.Queue()
         utterance_queue: asyncio.Queue[QueuedUtterance | None] = asyncio.Queue()
         microphone = MicrophoneCapture(
+            device_name=self._config.input_device,
             capture_sample_rate_hz=self._config.capture_sample_rate_hz,
             output_sample_rate_hz=self._config.sample_rate_hz,
             capture_chunk_frames=self._config.capture_chunk_frames,
@@ -149,12 +196,20 @@ class InterpreterApp:
 
     async def doctor(self) -> None:
         try:
-            devices = get_default_devices()
+            microphone_name = get_selected_microphone_name(self._config.input_device)
         except AudioUnavailableError as exc:
             LOGGER.warning("Audio device check failed: %s", exc)
         else:
-            LOGGER.info("Default microphone: %s", devices.default_microphone)
-            LOGGER.info("Default speaker: %s", devices.default_speaker)
+            label = "Selected microphone" if self._config.input_device else "Default microphone"
+            LOGGER.info("%s: %s", label, microphone_name)
+            if self._config.enable_tts:
+                try:
+                    speaker_name = get_selected_speaker_name(self._config.output_device)
+                except AudioUnavailableError as exc:
+                    LOGGER.warning("Speaker check failed: %s", exc)
+                else:
+                    label = "Selected speaker" if self._config.output_device else "Default speaker"
+                    LOGGER.info("%s: %s", label, speaker_name)
 
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -185,22 +240,26 @@ class InterpreterApp:
             self._config.translation_buffer_max_ms,
             self._config.translation_min_words,
         )
+        LOGGER.info("TTS: %s", "enabled" if self._config.enable_tts else "disabled")
         translator_probe = await verify_openai_text_generation(
             client,
             self._config.translation_model,
         )
         LOGGER.info("OpenAI text probe OK: %s", translator_probe or "<empty>")
 
-        tts = OpenAITTSService(
-            client=client,
-            model=self._config.tts_model,
-            voice=self._config.tts_voice,
-            instructions=self._config.tts_instructions,
-            speed=self._config.tts_speed,
-            sample_rate_hz=self._config.sample_rate_hz,
-        )
-        tts_bytes = await asyncio.to_thread(tts.verify_tts)
-        LOGGER.info("OpenAI TTS probe OK: %s bytes", tts_bytes)
+        if self._config.enable_tts:
+            tts = OpenAITTSService(
+                client=client,
+                model=self._config.tts_model,
+                voice=self._config.tts_voice,
+                instructions=self._config.tts_instructions,
+                speed=self._config.tts_speed,
+                sample_rate_hz=self._config.sample_rate_hz,
+            )
+            tts_bytes = await asyncio.to_thread(tts.verify_tts)
+            LOGGER.info("OpenAI TTS probe OK: %s bytes", tts_bytes)
+        else:
+            LOGGER.info("OpenAI TTS probe skipped because TTS is disabled.")
 
         transcriber = OpenAIRealtimeTranscriber(self._config, api_key)
         await transcriber.verify_connection()
@@ -213,7 +272,6 @@ class InterpreterApp:
         stream_task: asyncio.Task[None],
         playback_task: asyncio.Task[None],
     ) -> None:
-        last_partial_by_item: dict[str, str] = {}
         seen_completed_items: set[str] = set()
         next_sequence_id = 1
         buffered_english = ""
@@ -232,11 +290,11 @@ class InterpreterApp:
 
             if utterance_queue.qsize() >= 2:
                 LOGGER.warning(
-                    "Playback queue backlog is %s utterances. Mandarin audio may lag.",
+                    "Playback queue backlog is %s utterances. Translated audio may lag.",
                     utterance_queue.qsize(),
                 )
 
-            LOGGER.info("[segment-en %s] %s", next_sequence_id, english_text)
+            _emit_console_line("en", next_sequence_id, english_text)
             await utterance_queue.put(
                 QueuedUtterance(
                     sequence_id=next_sequence_id,
@@ -270,16 +328,11 @@ class InterpreterApp:
                 continue
 
             if update.is_partial:
-                last_text = last_partial_by_item.get(update.item_id)
-                if update.text != last_text:
-                    last_partial_by_item[update.item_id] = update.text
-                    LOGGER.info("[partial-en] %s", update.text)
                 continue
 
             if update.item_id in seen_completed_items:
                 continue
             seen_completed_items.add(update.item_id)
-            last_partial_by_item.pop(update.item_id, None)
             english_text = update.text.strip()
             if not english_text:
                 continue
@@ -308,8 +361,8 @@ class InterpreterApp:
         self,
         utterance_queue: asyncio.Queue[QueuedUtterance | None],
         translator: OpenAITranslator,
-        tts: OpenAITTSService,
-        speaker: SpeakerPlayback,
+        tts: OpenAITTSService | None,
+        speaker: SpeakerPlayback | None,
     ) -> None:
         while True:
             utterance = await utterance_queue.get()
@@ -317,21 +370,26 @@ class InterpreterApp:
                 return
 
             try:
-                LOGGER.info("[final-en %s] %s", utterance.sequence_id, utterance.english_text)
-
                 translate_started = time.monotonic()
-                mandarin_text = await translator.translate_text(utterance.english_text)
+                translated_text = await translator.translate_text(utterance.english_text)
                 translate_elapsed_ms = (time.monotonic() - translate_started) * 1000
-                LOGGER.info("[zh %s] %s", utterance.sequence_id, mandarin_text)
+                _emit_console_line("target", utterance.sequence_id, translated_text)
 
-                tts_metrics = await tts.stream_to_speaker(mandarin_text, speaker)
-                LOGGER.info(
-                    "Latencies[%s]: translate=%.0fms tts_first_audio=%.0fms tts_total=%.0fms",
-                    utterance.sequence_id,
-                    translate_elapsed_ms,
-                    tts_metrics.first_audio_ms or -1.0,
-                    tts_metrics.total_ms,
-                )
+                if tts is not None and speaker is not None:
+                    tts_metrics = await tts.stream_to_speaker(translated_text, speaker)
+                    LOGGER.info(
+                        "Latencies[%s]: translate=%.0fms tts_first_audio=%.0fms tts_total=%.0fms",
+                        utterance.sequence_id,
+                        translate_elapsed_ms,
+                        tts_metrics.first_audio_ms or -1.0,
+                        tts_metrics.total_ms,
+                    )
+                else:
+                    LOGGER.info(
+                        "Latencies[%s]: translate=%.0fms",
+                        utterance.sequence_id,
+                        translate_elapsed_ms,
+                    )
             except Exception:
                 LOGGER.exception(
                     "Failed while processing utterance %s.",

@@ -1,14 +1,15 @@
 # Interpreter OpenAI MVP
 
-Local macOS CLI that listens to English speech on the system default
-microphone, transcribes it with the OpenAI Realtime API, translates the
-transcript to Mandarin with a text model, and plays Mandarin speech through the
-system default speaker with OpenAI text-to-speech.
+Local macOS CLI that listens to English speech on a configurable macOS input
+device, transcribes it with the OpenAI Realtime API, translates the transcript
+into a configurable target language with a text model, and can optionally play
+translated speech through a configurable output device with OpenAI
+text-to-speech.
 
-This version keeps listening continuously while translated Mandarin is queued
-for playback. The pipeline is:
+This version keeps listening continuously while translated speech is queued
+for playback when TTS is enabled. The pipeline is:
 
-`microphone -> OpenAI Realtime transcription -> OpenAI text translation -> OpenAI TTS -> speaker`
+`microphone -> OpenAI Realtime transcription -> OpenAI text translation -> optional OpenAI TTS -> optional speaker`
 
 ## Why this architecture
 
@@ -66,15 +67,58 @@ Grant microphone access to your terminal app in System Settings:
 
 `doctor` checks:
 
-- default microphone and speaker visibility
+- selected microphone visibility
+- selected speaker visibility when `--enable-tts` is set
 - OpenAI API key presence
 - a small text-model translation probe
-- a small TTS probe
+- an optional TTS probe when `--enable-tts` is set
+
+To see the exact device names that the app can open through `soundcard`, run:
+
+```bash
+.venv/bin/python -m interpreter_openai devices
+```
+
+The current CoreAudio default device is marked with `*`.
 
 ### 5. Run the interpreter
 
 ```bash
 .venv/bin/python -m interpreter_openai run
+```
+
+This default run mode does not play translated audio. It only prints:
+
+- finalized English sent to translation
+- finalized translated output in the target language
+
+If you want speech playback, enable it explicitly:
+
+```bash
+.venv/bin/python -m interpreter_openai run --enable-tts
+```
+
+By default, the target language is Mandarin Chinese. You can change it, for
+example to Korean:
+
+```bash
+.venv/bin/python -m interpreter_openai run --target-language Korean
+```
+
+If your mixer or interface is not being picked up correctly through the macOS
+default device, pin the device explicitly by name or a unique substring:
+
+```bash
+.venv/bin/python -m interpreter_openai run --input-device Maono
+```
+
+If you also want translated speech to go back out through the interface:
+
+```bash
+.venv/bin/python -m interpreter_openai run \
+  --input-device Maono \
+  --output-device Maono \
+  --enable-tts
 ```
 
 To stop it from the terminal, use `Control-C`.
@@ -93,6 +137,9 @@ If you lose track of a running instance, use:
 
 - Realtime transcription model: `gpt-4o-transcribe`
 - Realtime session model: `gpt-realtime`
+- Target language: `Mandarin Chinese (Simplified Chinese script)`
+- Input device: system default unless `--input-device` is set
+- Output device: system default unless `--output-device` is set
 - Turn detection: `semantic_vad`
 - Semantic VAD eagerness: `low`
 - Max turn duration: `6000 ms`
@@ -101,6 +148,7 @@ If you lose track of a running instance, use:
 - Translation minimum words: `4`
 - Translation model: `gpt-4o`
 - Translation max output tokens: `192`
+- TTS enabled: `false`
 - TTS model: `gpt-4o-mini-tts`
 - TTS voice: `marin`
 - TTS speed: `1.15`
@@ -121,7 +169,7 @@ default. This bounds translation delay even when VAD is being conservative.
 Finalized English fragments are now buffered before translation. Instead of
 translating every committed fragment immediately, the app waits for sentence
 punctuation, a short idle gap, or a max buffer age, which produces more
-coherent Mandarin output when the speaker talks in long flowing clauses.
+coherent translated output when the speaker talks in long flowing clauses.
 
 If you want the older silence-based behavior, run:
 
@@ -156,9 +204,9 @@ Note: OpenAI's docs currently list `gpt-4o-transcribe-latest` as a supported
 Realtime transcription model, but this project defaults to `gpt-4o-transcribe`
 because some live endpoints currently reject the `-latest` alias.
 
-The playback path now starts speaking as TTS audio bytes arrive instead of
-waiting for the full clip to download first. This lowers perceived latency even
-if total synthesis time is still around one second.
+When TTS is enabled, playback starts speaking as TTS audio bytes arrive instead
+of waiting for the full clip to download first. This lowers perceived latency
+even if total synthesis time is still around one second.
 
 The app already pins a single named TTS voice on every request. To reduce
 occasional drift in delivery, the default TTS instructions also tell the model

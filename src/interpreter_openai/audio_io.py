@@ -21,27 +21,42 @@ class AudioDevices:
     default_speaker: str
 
 
+@dataclass(slots=True)
+class VisibleAudioDevices:
+    microphones: list[str]
+    speakers: list[str]
+
+
 class AudioUnavailableError(RuntimeError):
     """Raised when no usable default audio device is available."""
 
 
-def _default_microphone() -> object:
-    microphones = sc.all_microphones()
+def _all_microphones() -> list[object]:
+    microphones = list(sc.all_microphones())
     if not microphones:
         raise AudioUnavailableError(
-            "No default microphone is visible. Check macOS microphone permissions "
-            "for your terminal app and confirm a default input device exists."
+            "No microphone is visible. Check macOS microphone permissions for your "
+            "terminal app and confirm an input device exists."
         )
+    return microphones
+
+
+def _all_speakers() -> list[object]:
+    speakers = list(sc.all_speakers())
+    if not speakers:
+        raise AudioUnavailableError(
+            "No speaker is visible. Confirm macOS has an active output device."
+        )
+    return speakers
+
+
+def _default_microphone() -> object:
+    _all_microphones()
     return sc.default_microphone()
 
 
 def _default_speaker() -> object:
-    speakers = sc.all_speakers()
-    if not speakers:
-        raise AudioUnavailableError(
-            "No default speaker is visible. Confirm macOS has an active default "
-            "output device."
-        )
+    _all_speakers()
     return sc.default_speaker()
 
 
@@ -58,12 +73,119 @@ def _describe_device(device: object, fallback: str) -> str:
 
 
 def get_default_devices() -> AudioDevices:
-    microphone = _default_microphone()
-    speaker = _default_speaker()
     return AudioDevices(
-        default_microphone=_describe_device(microphone, "Default microphone"),
-        default_speaker=_describe_device(speaker, "Default speaker"),
+        default_microphone=get_default_microphone_name(),
+        default_speaker=get_default_speaker_name(),
     )
+
+
+def get_default_microphone_name() -> str:
+    microphone = _default_microphone()
+    return _describe_device(microphone, "Default microphone")
+
+
+def get_default_speaker_name() -> str:
+    speaker = _default_speaker()
+    return _describe_device(speaker, "Default speaker")
+
+
+def _device_names(devices: list[object], kind: str) -> list[str]:
+    return [
+        _describe_device(device, f"{kind} #{index + 1}")
+        for index, device in enumerate(devices)
+    ]
+
+
+def list_microphone_names() -> list[str]:
+    return _device_names(_all_microphones(), "Microphone")
+
+
+def list_speaker_names() -> list[str]:
+    return _device_names(_all_speakers(), "Speaker")
+
+
+def get_visible_devices() -> VisibleAudioDevices:
+    return VisibleAudioDevices(
+        microphones=list_microphone_names(),
+        speakers=list_speaker_names(),
+    )
+
+
+def _resolve_device(
+    requested_name: str | None,
+    *,
+    kind: str,
+    devices: list[object],
+    default_device_getter,
+) -> object:
+    if not requested_name or not requested_name.strip():
+        return default_device_getter()
+
+    selector = requested_name.strip().casefold()
+    by_name: dict[str, list[object]] = {}
+    for device in devices:
+        device_name = _describe_device(device, kind).strip()
+        by_name.setdefault(device_name.casefold(), []).append(device)
+
+    exact_matches = by_name.get(selector, [])
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        names = ", ".join(
+            _describe_device(match, kind) for match in exact_matches
+        )
+        raise AudioUnavailableError(
+            f"Multiple {kind.lower()} devices match '{requested_name}': {names}. "
+            "Use a more specific device name."
+        )
+
+    substring_matches = [
+        device
+        for device in devices
+        if selector in _describe_device(device, kind).casefold()
+    ]
+    if len(substring_matches) == 1:
+        return substring_matches[0]
+    if len(substring_matches) > 1:
+        names = ", ".join(
+            _describe_device(match, kind) for match in substring_matches
+        )
+        raise AudioUnavailableError(
+            f"Multiple {kind.lower()} devices match '{requested_name}': {names}. "
+            "Use a more specific device name."
+        )
+
+    available = ", ".join(_device_names(devices, kind))
+    raise AudioUnavailableError(
+        f"No {kind.lower()} device matches '{requested_name}'. Available "
+        f"{kind.lower()} devices: {available}"
+    )
+
+
+def _selected_microphone(requested_name: str | None) -> object:
+    return _resolve_device(
+        requested_name,
+        kind="Microphone",
+        devices=_all_microphones(),
+        default_device_getter=_default_microphone,
+    )
+
+
+def _selected_speaker(requested_name: str | None) -> object:
+    return _resolve_device(
+        requested_name,
+        kind="Speaker",
+        devices=_all_speakers(),
+        default_device_getter=_default_speaker,
+    )
+
+
+def get_selected_microphone_name(requested_name: str | None) -> str:
+    return _describe_device(_selected_microphone(requested_name), "Microphone")
+
+
+def get_selected_speaker_name(requested_name: str | None) -> str:
+    return _describe_device(_selected_speaker(requested_name), "Speaker")
 
 
 def float_audio_to_pcm16_bytes(data: np.ndarray) -> bytes:
@@ -108,10 +230,12 @@ def resample_float_audio(
 class MicrophoneCapture:
     def __init__(
         self,
+        device_name: str | None,
         capture_sample_rate_hz: int,
         output_sample_rate_hz: int,
         capture_chunk_frames: int,
     ) -> None:
+        self._device_name = device_name
         self._capture_sample_rate_hz = capture_sample_rate_hz
         self._output_sample_rate_hz = output_sample_rate_hz
         self._capture_chunk_frames = capture_chunk_frames
@@ -152,10 +276,11 @@ class MicrophoneCapture:
     def _capture_loop(self) -> None:
         if self._loop is None or self._queue is None:
             raise RuntimeError("Capture loop started before initialization.")
-        microphone = _default_microphone()
+        microphone = _selected_microphone(self._device_name)
         try:
             LOGGER.info(
-                "Microphone capture started at %s Hz, resampling to %s Hz.",
+                "Microphone capture started from %s at %s Hz, resampling to %s Hz.",
+                _describe_device(microphone, "Microphone"),
                 self._capture_sample_rate_hz,
                 self._output_sample_rate_hz,
             )
@@ -198,11 +323,13 @@ class MicrophoneCapture:
 class SpeakerPlayback:
     def __init__(
         self,
+        device_name: str | None,
         sample_rate_hz: int,
         drain_ms: int,
         target_rms: float,
         max_gain: float,
     ) -> None:
+        self._device_name = device_name
         self._sample_rate_hz = sample_rate_hz
         self._drain_ms = drain_ms
         self._target_rms = target_rms
@@ -215,14 +342,14 @@ class SpeakerPlayback:
 
     def _play_pcm16_blocking(self, audio_bytes: bytes) -> None:
         audio = pcm16_bytes_to_float_audio(audio_bytes)
-        speaker = _default_speaker()
+        speaker = _selected_speaker(self._device_name)
         normalized = self._normalize_for_playback(audio)
         speaker.play(normalized, samplerate=self._sample_rate_hz)
         if self._drain_ms > 0:
             time.sleep(self._drain_ms / 1000)
 
     def play_pcm16_stream_blocking(self, audio_chunks) -> None:
-        speaker = _default_speaker()
+        speaker = _selected_speaker(self._device_name)
         block_frames = max(1, self._sample_rate_hz // 10)
         previous_block: np.ndarray | None = None
 

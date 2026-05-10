@@ -10,6 +10,23 @@ def _optional_path(value: str | None) -> Path | None:
     return Path(value).expanduser() if value else None
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _default_tts_instructions(target_language_label: str) -> str:
+    return (
+        f"Speak in consistent {target_language_label} using the same speaker identity "
+        "on every utterance. Keep the same timbre, persona, accent, pacing baseline, "
+        "and overall delivery from clip to clip. Do not roleplay, do not change "
+        "character, and do not vary age or personality. Use a calm, warm live "
+        "interpretation style with clear diction and restrained emphasis."
+    )
+
+
 @dataclass(slots=True)
 class AppConfig:
     command: str
@@ -17,6 +34,8 @@ class AppConfig:
     realtime_session_model: str
     source_language: str
     target_language_label: str
+    input_device: str | None
+    output_device: str | None
     transcription_model: str
     turn_detection_type: str
     semantic_vad_eagerness: str
@@ -26,6 +45,7 @@ class AppConfig:
     translation_min_words: int
     translation_model: str
     translation_max_output_tokens: int
+    enable_tts: bool
     tts_model: str
     tts_voice: str
     tts_instructions: str
@@ -55,13 +75,13 @@ class AppConfig:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="interpreter-openai",
-        description="Local macOS CLI English-to-Mandarin interpreter built with OpenAI APIs.",
+        description="Local macOS CLI English-to-target-language interpreter built with OpenAI APIs.",
     )
     parser.add_argument(
         "command",
         nargs="?",
         default="run",
-        choices=("run", "doctor", "stop", "status"),
+        choices=("run", "doctor", "devices", "stop", "status"),
         help="Run the interpreter loop, verify local setup, or control a running instance.",
     )
     parser.add_argument(
@@ -83,12 +103,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="ISO-639-1 source language code for transcription.",
     )
     parser.add_argument(
+        "--target-language",
         "--target-language-label",
+        dest="target_language_label",
         default=os.getenv(
-            "INTERPRETER_OPENAI_TARGET_LANGUAGE_LABEL",
-            "Mandarin Chinese (Simplified Chinese script)",
+            "INTERPRETER_OPENAI_TARGET_LANGUAGE",
+            os.getenv(
+                "INTERPRETER_OPENAI_TARGET_LANGUAGE_LABEL",
+                "Mandarin Chinese (Simplified Chinese script)",
+            ),
         ),
-        help="Target language description used in translation prompting.",
+        help=(
+            "Target language used for translation and optional TTS, for example "
+            "'Mandarin Chinese (Simplified Chinese script)' or 'Korean'."
+        ),
+    )
+    parser.add_argument(
+        "--input-device",
+        default=os.getenv("INTERPRETER_OPENAI_INPUT_DEVICE"),
+        help=(
+            "Optional microphone device name or unique substring, for example "
+            "'Maono'. Defaults to the system default input device."
+        ),
+    )
+    parser.add_argument(
+        "--output-device",
+        default=os.getenv("INTERPRETER_OPENAI_OUTPUT_DEVICE"),
+        help=(
+            "Optional speaker device name or unique substring, for example "
+            "'Maono'. Defaults to the system default output device."
+        ),
     )
     parser.add_argument(
         "--transcription-model",
@@ -154,13 +198,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--translation-model",
         default=os.getenv("INTERPRETER_OPENAI_TRANSLATION_MODEL", "gpt-4o"),
-        help="Text model used for English-to-Mandarin translation.",
+        help="Text model used for English-to-target-language translation.",
     )
     parser.add_argument(
         "--translation-max-output-tokens",
         type=int,
         default=int(os.getenv("INTERPRETER_OPENAI_TRANSLATION_MAX_OUTPUT_TOKENS", "192")),
         help="Maximum output tokens for the translation step.",
+    )
+    parser.add_argument(
+        "--enable-tts",
+        action="store_true",
+        default=_env_flag("INTERPRETER_OPENAI_ENABLE_TTS", False),
+        help="Enable translated text-to-speech playback. Disabled by default.",
     )
     parser.add_argument(
         "--tts-model",
@@ -174,17 +224,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tts-instructions",
-        default=os.getenv(
-            "INTERPRETER_OPENAI_TTS_INSTRUCTIONS",
-            (
-                "Speak in consistent Mandarin using the same speaker identity on every "
-                "utterance. Keep the same timbre, persona, accent, pacing baseline, and "
-                "overall delivery from clip to clip. Do not roleplay, do not change "
-                "character, and do not vary age or personality. Use a calm, warm church "
-                "interpretation style with clear diction and restrained emphasis."
-            ),
+        default=os.getenv("INTERPRETER_OPENAI_TTS_INSTRUCTIONS"),
+        help=(
+            "Speech style instructions for the TTS model. By default this is derived "
+            "from the target language."
         ),
-        help="Speech style instructions for the TTS model.",
     )
     parser.add_argument(
         "--tts-speed",
@@ -202,7 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--sample-rate-hz",
         type=int,
         default=int(os.getenv("INTERPRETER_OPENAI_SAMPLE_RATE_HZ", "24000")),
-        help="Audio sample rate used for OpenAI input and TTS playback.",
+        help="Audio sample rate used for OpenAI input and optional TTS playback.",
     )
     parser.add_argument(
         "--chunk-duration-ms",
@@ -238,7 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--glossary-file",
         type=Path,
         default=_optional_path(os.getenv("INTERPRETER_OPENAI_GLOSSARY_FILE")),
-        help="Optional CSV glossary for sermon terminology.",
+        help="Optional CSV glossary for interpretation terminology.",
     )
     parser.add_argument(
         "--translation-notes-file",
@@ -270,12 +314,17 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_args(argv: list[str] | None = None) -> AppConfig:
     args = build_parser().parse_args(argv)
     noise_reduction_mode = None if args.noise_reduction_mode == "none" else args.noise_reduction_mode
+    tts_instructions = args.tts_instructions or _default_tts_instructions(
+        args.target_language_label
+    )
     return AppConfig(
         command=args.command,
         openai_project=args.openai_project,
         realtime_session_model=args.realtime_session_model,
         source_language=args.source_language,
         target_language_label=args.target_language_label,
+        input_device=args.input_device,
+        output_device=args.output_device,
         transcription_model=args.transcription_model,
         turn_detection_type=args.turn_detection_type,
         semantic_vad_eagerness=args.semantic_vad_eagerness,
@@ -285,9 +334,10 @@ def parse_args(argv: list[str] | None = None) -> AppConfig:
         translation_min_words=args.translation_min_words,
         translation_model=args.translation_model,
         translation_max_output_tokens=args.translation_max_output_tokens,
+        enable_tts=args.enable_tts,
         tts_model=args.tts_model,
         tts_voice=args.tts_voice,
-        tts_instructions=args.tts_instructions,
+        tts_instructions=tts_instructions,
         tts_speed=args.tts_speed,
         capture_sample_rate_hz=args.capture_sample_rate_hz,
         sample_rate_hz=args.sample_rate_hz,

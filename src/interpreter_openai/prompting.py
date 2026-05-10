@@ -63,6 +63,7 @@ def build_translation_instructions(
     glossary_entries: list[GlossaryEntry],
     extra_notes: str | None,
 ) -> str:
+    target_language_lower = target_language_label.lower()
     sections = [
         "# Role",
         (
@@ -73,11 +74,21 @@ def build_translation_instructions(
         "- Return only the translation.",
         "- Do not explain, summarize, annotate, or add stage directions.",
         "- Preserve theological meaning exactly.",
-        "- Prefer natural spoken Mandarin suitable for live interpretation.",
-        "- Use standard Chinese Christian terminology.",
+        f"- Prefer natural spoken {target_language_label} suitable for live interpretation.",
+        f"- Use standard Christian terminology appropriate for {target_language_label}.",
         "- Preserve scripture references clearly and naturally.",
         "- If the input is incomplete spoken language, translate conservatively without inventing new content.",
     ]
+
+    if "mandarin" in target_language_lower or "chinese" in target_language_lower:
+        sections.extend(
+            [
+                "- Prefer standard Mandarin suitable for live church interpretation.",
+                "- Use standard Chinese Christian terminology.",
+            ]
+        )
+    elif "korean" in target_language_lower:
+        sections.append("- Use standard Korean Christian terminology.")
 
     if glossary_entries:
         sections.extend(["# Required Terminology"])

@@ -18,6 +18,9 @@ async def _run(config) -> int:
     if config.command == "doctor":
         await app.doctor()
         return 0
+    if config.command == "devices":
+        await app.list_devices()
+        return 0
     if config.command == "status":
         LOGGER.info("%s", status_message())
         return 0
@@ -29,8 +32,8 @@ async def _run(config) -> int:
 
 
 def main() -> None:
-    configure_logging()
     config = parse_args()
+    configure_logging(level=logging.WARNING if config.command == "run" else logging.INFO)
     try:
         if config.command == "run":
             with InstanceLock():
