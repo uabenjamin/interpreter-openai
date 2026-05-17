@@ -3,17 +3,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
-from openai import AsyncOpenAI
+from websockets.asyncio.client import ClientConnection, connect
+from websockets.exceptions import ConnectionClosed
 
 from .config import AppConfig
 from .error_handling import UserFacingError
 
 
 LOGGER = logging.getLogger(__name__)
+TRANSCRIPTION_WEBSOCKET_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 
 
 @dataclass(slots=True)
@@ -26,14 +29,12 @@ class TranscriptUpdate:
 class OpenAIRealtimeTranscriber:
     def __init__(self, config: AppConfig, api_key: str) -> None:
         self._config = config
-        self._client = AsyncOpenAI(
-            api_key=api_key,
-            project=config.openai_project,
-        )
+        self._api_key = api_key
         self._commit_counter = 0
         self._speech_active = False
         self._turn_started_at: float | None = None
         self._manual_commit_pending = False
+        self._buffered_chunk_count = 0
 
     async def stream_audio(
         self,
@@ -44,15 +45,9 @@ class OpenAIRealtimeTranscriber:
         self._speech_active = False
         self._turn_started_at = None
         self._manual_commit_pending = False
-        async with self._client.beta.realtime.connect(
-            model=self._config.realtime_session_model,
-            websocket_connection_options={
-                "max_size": None,
-                "ping_interval": 20,
-                "ping_timeout": 20,
-            },
-        ) as connection:
-            await connection.session.update(session=self._session_update())
+        self._buffered_chunk_count = 0
+        async with self._connect_transcription() as connection:
+            await self._send_event(connection, self._transcription_session_update())
             receiver = asyncio.create_task(
                 self._receive_events(connection, transcript_queue, ready_event)
             )
@@ -74,85 +69,146 @@ class OpenAIRealtimeTranscriber:
                     await task
 
     async def verify_connection(self) -> None:
-        async with self._client.beta.realtime.connect(
-            model=self._config.realtime_session_model,
-            websocket_connection_options={
-                "max_size": None,
-                "ping_interval": 20,
-                "ping_timeout": 20,
-            },
-        ) as connection:
-            await connection.session.update(session=self._session_update())
+        async with self._connect_transcription() as connection:
+            await self._send_event(connection, self._transcription_session_update())
             deadline = asyncio.get_running_loop().time() + 10
             while True:
                 if asyncio.get_running_loop().time() > deadline:
                     raise UserFacingError(
                         "Timed out while opening the OpenAI realtime transcription session."
                     )
-                event = await asyncio.wait_for(connection.recv(), timeout=1)
-                event_type = getattr(event, "type", None)
-                if event_type == "session.created":
+                try:
+                    event = await asyncio.wait_for(
+                        self._recv_event(connection),
+                        timeout=1,
+                    )
+                except asyncio.TimeoutError:
                     continue
-                if event_type == "session.updated":
+                except ConnectionClosed as exc:
+                    raise UserFacingError(
+                        "OpenAI realtime transcription session closed before it was configured."
+                    ) from exc
+                event_type = self._event_field(event, "type")
+                if event_type in {"session.created", "transcription_session.created"}:
+                    continue
+                if event_type in {"session.updated", "transcription_session.updated"}:
                     return
                 if event_type == "error":
                     raise UserFacingError(self._format_error_event(event))
 
-    def _session_update(self) -> dict[str, object]:
-        session: dict[str, object] = {
-            "input_audio_format": "pcm16",
-            "input_audio_transcription": {
+    def _connect_transcription(self):
+        return connect(
+            TRANSCRIPTION_WEBSOCKET_URL,
+            additional_headers=self._auth_headers(),
+            max_size=None,
+            ping_interval=20,
+            ping_timeout=20,
+        )
+
+    def _auth_headers(self) -> dict[str, str]:
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        if self._config.openai_project:
+            headers["OpenAI-Project"] = self._config.openai_project
+        return headers
+
+    async def _send_event(
+        self,
+        connection: ClientConnection,
+        event: dict[str, object],
+    ) -> None:
+        await connection.send(json.dumps(event))
+
+    async def _iter_events(
+        self,
+        connection: ClientConnection,
+    ) -> AsyncIterator[dict[str, object]]:
+        async for message in connection:
+            yield self._parse_event_message(message)
+
+    async def _recv_event(self, connection: ClientConnection) -> dict[str, object]:
+        message = await connection.recv()
+        return self._parse_event_message(message)
+
+    def _parse_event_message(self, message: str | bytes) -> dict[str, object]:
+        if isinstance(message, bytes):
+            message = message.decode("utf-8")
+        parsed = json.loads(message)
+        if not isinstance(parsed, dict):
+            return {"type": "unknown", "payload": parsed}
+        return parsed
+
+    def _transcription_session_update(self) -> dict[str, object]:
+        audio_input: dict[str, object] = {
+            "format": {
+                "type": "audio/pcm",
+                "rate": self._config.sample_rate_hz,
+            },
+            "transcription": {
                 "model": self._config.transcription_model,
                 "language": self._config.source_language,
-                "prompt": (
-                    "Transcribe spoken English clearly. Keep scripture references, "
-                    "proper names, and church terminology accurate. Prefer complete "
-                    "phrases over isolated words when speech is continuous."
-                ),
             },
-            "modalities": ["text"],
-            "turn_detection": self._build_turn_detection(),
+        }
+        turn_detection = self._build_turn_detection()
+        if turn_detection is not None:
+            audio_input["turn_detection"] = turn_detection
+
+        session: dict[str, object] = {
+            "type": "session.update",
+            "session": {
+                "type": "transcription",
+                "audio": {
+                    "input": audio_input,
+                },
+            },
         }
         if self._config.noise_reduction_mode is not None:
-            session["input_audio_noise_reduction"] = {
+            session["session"]["audio"]["input"]["noise_reduction"] = {
                 "type": self._config.noise_reduction_mode
             }
         return session
 
-    def _build_turn_detection(self) -> dict[str, object]:
+    def _build_turn_detection(self) -> dict[str, object] | None:
+        if (
+            self._config.turn_detection_type == "none"
+            or self._config.transcription_model == "gpt-realtime-whisper"
+        ):
+            return None
         if self._config.turn_detection_type == "semantic_vad":
             return {
                 "type": "semantic_vad",
                 "eagerness": self._config.semantic_vad_eagerness,
-                "create_response": False,
-                "interrupt_response": False,
             }
         return {
             "type": "server_vad",
             "threshold": self._config.vad_threshold,
             "prefix_padding_ms": self._config.vad_prefix_padding_ms,
             "silence_duration_ms": self._config.vad_silence_ms,
-            "create_response": False,
-            "interrupt_response": False,
         }
 
     async def _send_audio(
         self,
-        connection,
+        connection: ClientConnection,
         audio_source: AsyncIterator[bytes],
     ) -> None:
         chunks_sent = 0
         async for chunk in audio_source:
-            await connection.input_audio_buffer.append(
-                audio=base64.b64encode(chunk).decode("ascii")
+            await self._send_event(
+                connection,
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(chunk).decode("ascii"),
+                },
             )
             chunks_sent += 1
+            self._buffered_chunk_count += 1
+            if not self._uses_server_turn_detection() and self._turn_started_at is None:
+                self._turn_started_at = asyncio.get_running_loop().time()
             if chunks_sent == 1:
                 LOGGER.info("Streaming microphone audio to OpenAI.")
 
     async def _receive_events(
         self,
-        connection,
+        connection: ClientConnection,
         transcript_queue: asyncio.Queue[TranscriptUpdate],
         ready_event: asyncio.Event,
     ) -> None:
@@ -162,14 +218,14 @@ class OpenAIRealtimeTranscriber:
         completed_text_by_item: dict[str, str] = {}
         emitted_items: set[str] = set()
 
-        async for event in connection:
-            event_type = getattr(event, "type", None)
+        async for event in self._iter_events(connection):
+            event_type = self._event_field(event, "type")
 
-            if event_type == "session.created":
+            if event_type in {"session.created", "transcription_session.created"}:
                 LOGGER.info("OpenAI realtime session created.")
                 continue
 
-            if event_type == "session.updated":
+            if event_type in {"session.updated", "transcription_session.updated"}:
                 LOGGER.info("OpenAI realtime session configured for transcription.")
                 ready_event.set()
                 continue
@@ -188,13 +244,16 @@ class OpenAIRealtimeTranscriber:
                 continue
 
             if event_type == "input_audio_buffer.committed":
-                item_id = str(getattr(event, "item_id", "") or "")
+                item_id = str(self._event_field(event, "item_id", "") or "")
                 if not item_id:
                     continue
-                previous_item_id = getattr(event, "previous_item_id", None)
+                previous_item_id = self._event_field(event, "previous_item_id")
                 self._manual_commit_pending = False
+                self._buffered_chunk_count = 0
                 self._turn_started_at = (
-                    asyncio.get_running_loop().time() if self._speech_active else None
+                    asyncio.get_running_loop().time()
+                    if self._speech_active or not self._uses_server_turn_detection()
+                    else None
                 )
                 LOGGER.info("Audio turn committed.")
                 pending_commits[item_id] = (
@@ -212,8 +271,8 @@ class OpenAIRealtimeTranscriber:
                 continue
 
             if event_type == "conversation.item.input_audio_transcription.delta":
-                item_id = str(getattr(event, "item_id", "") or "")
-                delta = str(getattr(event, "delta", "") or "")
+                item_id = str(self._event_field(event, "item_id", "") or "")
+                delta = str(self._event_field(event, "delta", "") or "")
                 if not item_id or not delta:
                     continue
                 next_text = f"{partial_text_by_item.get(item_id, '')}{delta}"
@@ -224,8 +283,8 @@ class OpenAIRealtimeTranscriber:
                 continue
 
             if event_type == "conversation.item.input_audio_transcription.segment":
-                item_id = str(getattr(event, "item_id", "") or "")
-                segment_text = str(getattr(event, "text", "") or "").strip()
+                item_id = str(self._event_field(event, "item_id", "") or "")
+                segment_text = str(self._event_field(event, "text", "") or "").strip()
                 if not item_id or not segment_text:
                     continue
                 await transcript_queue.put(
@@ -234,8 +293,8 @@ class OpenAIRealtimeTranscriber:
                 continue
 
             if event_type == "conversation.item.input_audio_transcription.completed":
-                item_id = str(getattr(event, "item_id", "") or "")
-                transcript = str(getattr(event, "transcript", "") or "").strip()
+                item_id = str(self._event_field(event, "item_id", "") or "")
+                transcript = str(self._event_field(event, "transcript", "") or "").strip()
                 if not item_id:
                     continue
                 if transcript:
@@ -251,35 +310,43 @@ class OpenAIRealtimeTranscriber:
                 continue
 
             if event_type == "conversation.item.input_audio_transcription.failed":
-                error = getattr(event, "error", None)
-                message = getattr(error, "message", None) or "Unknown transcription failure."
+                error = self._event_field(event, "error")
+                message = (
+                    self._error_field(error, "message")
+                    or "Unknown transcription failure."
+                )
                 LOGGER.warning("Input audio transcription failed: %s", message)
                 continue
 
             if event_type == "error":
-                if self._is_benign_empty_buffer_commit_error(event):
+                if self._is_benign_small_commit_error(event):
                     self._manual_commit_pending = False
+                    if self._speech_active or not self._uses_server_turn_detection():
+                        self._turn_started_at = asyncio.get_running_loop().time()
                     LOGGER.debug(
-                        "Ignoring empty audio buffer commit race while forcing a long turn."
+                        "Ignoring undersized audio buffer commit while forcing a long turn."
                     )
                     continue
                 raise UserFacingError(self._format_error_event(event))
 
-    async def _force_commit_long_turns(self, connection) -> None:
+    async def _force_commit_long_turns(self, connection: ClientConnection) -> None:
         while True:
             await asyncio.sleep(0.2)
-            if not self._speech_active:
-                continue
             if self._manual_commit_pending:
                 continue
             if self._turn_started_at is None:
                 self._turn_started_at = asyncio.get_running_loop().time()
                 continue
 
+            if self._uses_server_turn_detection() and not self._speech_active:
+                continue
+
             elapsed_ms = (
                 asyncio.get_running_loop().time() - self._turn_started_at
             ) * 1000
             if elapsed_ms < self._config.max_turn_ms:
+                continue
+            if self._buffered_audio_ms() < 250:
                 continue
 
             self._manual_commit_pending = True
@@ -288,7 +355,7 @@ class OpenAIRealtimeTranscriber:
                 elapsed_ms / 1000,
             )
             try:
-                await connection.input_audio_buffer.commit()
+                await self._send_event(connection, {"type": "input_audio_buffer.commit"})
             except Exception:
                 self._manual_commit_pending = False
                 raise
@@ -331,23 +398,45 @@ class OpenAIRealtimeTranscriber:
                 )
 
     def _format_error_event(self, event) -> str:
-        error = getattr(event, "error", None)
-        message = getattr(error, "message", None)
+        error = self._event_field(event, "error")
+        message = self._error_field(error, "message")
         if message:
             return f"OpenAI realtime error: {message}"
         return f"OpenAI realtime error: {event}"
 
-    def _is_benign_empty_buffer_commit_error(self, event) -> bool:
-        error = getattr(event, "error", None)
+    def _buffered_audio_ms(self) -> int:
+        return self._buffered_chunk_count * self._config.chunk_duration_ms
+
+    def _uses_server_turn_detection(self) -> bool:
+        return self._build_turn_detection() is not None
+
+    def _is_benign_small_commit_error(self, event) -> bool:
+        error = self._event_field(event, "error")
         if error is None:
             return False
-        message = str(getattr(error, "message", "") or "").lower()
-        code = str(getattr(error, "code", "") or "").lower()
+        message = str(self._error_field(error, "message", "") or "").lower()
+        code = str(self._error_field(error, "code", "") or "").lower()
         return (
             "input audio buffer is empty" in message
             or (
                 "input audio buffer" in message
                 and "empty" in message
             )
+            or "buffer too small" in message
+            or (
+                "input audio buffer" in message
+                and "too small" in message
+            )
             or code == "input_audio_buffer_empty"
+            or code == "input_audio_buffer_too_small"
         )
+
+    def _event_field(self, event, name: str, default=None):
+        if isinstance(event, dict):
+            return event.get(name, default)
+        return getattr(event, name, default)
+
+    def _error_field(self, error, name: str, default=None):
+        if isinstance(error, dict):
+            return error.get(name, default)
+        return getattr(error, name, default)

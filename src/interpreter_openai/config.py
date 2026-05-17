@@ -100,7 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
             "INTERPRETER_OPENAI_REALTIME_SESSION_MODEL",
             "gpt-realtime",
         ),
-        help="OpenAI Realtime session model used for the WebSocket connection.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--source-language",
@@ -143,17 +143,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--transcription-model",
         default=os.getenv(
             "INTERPRETER_OPENAI_TRANSCRIPTION_MODEL",
-            "gpt-4o-transcribe",
+            "gpt-realtime-whisper",
         ),
         help="Realtime transcription model.",
     )
     parser.add_argument(
         "--turn-detection-type",
-        default=os.getenv("INTERPRETER_OPENAI_TURN_DETECTION_TYPE", "semantic_vad"),
-        choices=("server_vad", "semantic_vad"),
+        default=os.getenv("INTERPRETER_OPENAI_TURN_DETECTION_TYPE", "none"),
+        choices=("none", "server_vad", "semantic_vad"),
         help=(
-            "OpenAI Realtime turn detection mode. semantic_vad is usually better "
-            "for fast, continuous speakers."
+            "OpenAI Realtime turn detection mode. Use none for manual commits; "
+            "gpt-realtime-whisper currently rejects server-side turn detection."
         ),
     )
     parser.add_argument(
@@ -208,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--translation-max-output-tokens",
         type=int,
-        default=int(os.getenv("INTERPRETER_OPENAI_TRANSLATION_MAX_OUTPUT_TOKENS", "192")),
+        default=int(os.getenv("INTERPRETER_OPENAI_TRANSLATION_MAX_OUTPUT_TOKENS", "320")),
         help="Maximum output tokens for the translation step.",
     )
     parser.add_argument(
@@ -355,6 +355,12 @@ def parse_args(argv: list[str] | None = None) -> AppConfig:
     tts_instructions = args.tts_instructions or _default_tts_instructions(
         args.target_language_label
     )
+    turn_detection_type = args.turn_detection_type
+    if (
+        args.transcription_model == "gpt-realtime-whisper"
+        and turn_detection_type in {"server_vad", "semantic_vad"}
+    ):
+        turn_detection_type = "none"
     return AppConfig(
         command=args.command,
         openai_project=args.openai_project,
@@ -364,7 +370,7 @@ def parse_args(argv: list[str] | None = None) -> AppConfig:
         input_device=args.input_device,
         output_device=args.output_device,
         transcription_model=args.transcription_model,
-        turn_detection_type=args.turn_detection_type,
+        turn_detection_type=turn_detection_type,
         semantic_vad_eagerness=args.semantic_vad_eagerness,
         max_turn_ms=args.max_turn_ms,
         translation_buffer_silence_ms=args.translation_buffer_silence_ms,

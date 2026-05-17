@@ -113,11 +113,7 @@ class InterpreterApp:
             except AudioUnavailableError as exc:
                 raise UserFacingError(str(exc)) from exc
             LOGGER.info("Using speaker: %s", speaker_name)
-        LOGGER.info(
-            "Realtime session model: %s | transcription model: %s",
-            self._config.realtime_session_model,
-            self._config.transcription_model,
-        )
+        LOGGER.info("Realtime transcription model: %s", self._config.transcription_model)
         LOGGER.info(
             "Turn detection: %s%s",
             self._config.turn_detection_type,
@@ -229,11 +225,7 @@ class InterpreterApp:
             )
 
         client = build_client(self._config)
-        LOGGER.info(
-            "Realtime session model: %s | transcription model: %s",
-            self._config.realtime_session_model,
-            self._config.transcription_model,
-        )
+        LOGGER.info("Realtime transcription model: %s", self._config.transcription_model)
         LOGGER.info(
             "Turn detection: %s%s",
             self._config.turn_detection_type,

@@ -42,4 +42,9 @@ def classify_openai_error(exc: Exception) -> str | None:
             "OpenAI authentication failed. Check OPENAI_API_KEY and confirm the "
             "key is active."
         )
+    if "beta_api_shape_disabled" in message.lower():
+        return (
+            "This app hit the removed OpenAI Realtime beta interface. Update to the "
+            "latest interpreter-openai code that uses the GA Realtime session shape."
+        )
     return None
