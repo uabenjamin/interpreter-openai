@@ -73,10 +73,15 @@ def build_translation_instructions(
         "# Output Rules",
         "- Return only the translation.",
         "- Do not explain, summarize, annotate, or add stage directions.",
+        "- If previous context is provided, use it only for continuity and translate only the current segment.",
         "- Preserve theological meaning exactly.",
         f"- Prefer natural spoken {target_language_label} suitable for live interpretation.",
         f"- Use standard Christian terminology appropriate for {target_language_label}.",
         "- Preserve scripture references clearly and naturally.",
+        "- Do not invent book names, chapter numbers, verse numbers, or missing clauses.",
+        "- When the current segment quotes or closely paraphrases Scripture, preserve the biblical meaning and register rather than simplifying it.",
+        "- If a Scripture quote is recognizable, use wording familiar to the target-language church tradition where appropriate.",
+        "- If a Scripture quote is split across segments, maintain continuity with the previous context while translating only the current segment.",
         "- If the input is incomplete spoken language, translate conservatively without inventing new content.",
     ]
 
@@ -85,6 +90,7 @@ def build_translation_instructions(
             [
                 "- Prefer standard Mandarin suitable for live church interpretation.",
                 "- Use standard Chinese Christian terminology.",
+                "- For recognizable Bible quotations, prefer Mandarin wording familiar to Chinese Protestant congregations, especially Chinese Union Version style when it fits.",
             ]
         )
     elif "korean" in target_language_lower:
