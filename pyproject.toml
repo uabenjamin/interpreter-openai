@@ -11,6 +11,7 @@ requires-python = ">=3.11,<3.12"
 dependencies = [
   "numpy>=2.0.0,<3",
   "openai>=1.100.0,<2",
+  "PySide6-Essentials>=6.7,<7",
   "soundcard>=0.4.5,<0.5",
   "websockets>=15.0,<16",
 ]

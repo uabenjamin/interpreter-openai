@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 
 from .audio_io import (
@@ -108,8 +108,27 @@ class QueuedUtterance:
 
 
 class InterpreterApp:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        output_handler: Callable[[str, int | None, str], None] | None = None,
+        status_handler: Callable[[str], None] | None = None,
+    ) -> None:
         self._config = config
+        self._output_handler = output_handler
+        self._status_handler = status_handler
+
+    def _emit_console_line(self, label: str, sequence_id: int, text: str) -> None:
+        if self._output_handler is not None:
+            self._output_handler(label, sequence_id, text)
+            return
+        _emit_console_line(label, sequence_id, text)
+
+    def _emit_status_line(self, text: str) -> None:
+        if self._status_handler is not None:
+            self._status_handler(text)
+            return
+        _emit_status_line(text)
 
     async def list_devices(self) -> None:
         print("Input devices:", flush=True)
@@ -170,7 +189,7 @@ class InterpreterApp:
         if self._config.input_audio_file is not None:
             input_source_label = str(self._config.input_audio_file)
             LOGGER.info("Using input audio file: %s", input_source_label)
-            _emit_status_line(f"input audio file: {input_source_label}")
+            self._emit_status_line(f"input audio file: {input_source_label}")
         else:
             try:
                 microphone_name = get_selected_microphone_name(self._config.input_device)
@@ -178,21 +197,21 @@ class InterpreterApp:
                 raise UserFacingError(str(exc)) from exc
             input_source_label = microphone_name
             LOGGER.info("Using microphone: %s", microphone_name)
-            _emit_status_line(f"input device: {microphone_name}")
+            self._emit_status_line(f"input device: {microphone_name}")
         if self._config.enable_tts:
             try:
                 speaker_name = get_selected_speaker_name(self._config.output_device)
             except AudioUnavailableError as exc:
                 raise UserFacingError(str(exc)) from exc
             LOGGER.info("Using speaker: %s", speaker_name)
-            _emit_status_line(f"output device: {speaker_name}")
+            self._emit_status_line(f"output device: {speaker_name}")
         else:
             if self._config.output_device:
-                _emit_status_line(
+                self._emit_status_line(
                     "TTS is disabled, so --output-device is ignored. Add --enable-tts for speaker output."
                 )
             else:
-                _emit_status_line("TTS is disabled; translated text will print to stdout only.")
+                self._emit_status_line("TTS is disabled; translated text will print to stdout only.")
         LOGGER.info("Realtime transcription model: %s", self._config.transcription_model)
         LOGGER.info(
             "Turn detection: %s%s",
@@ -216,11 +235,11 @@ class InterpreterApp:
             "Listening continuously. Use Control-C to stop. Command-C usually "
             "copies text and does not stop terminal apps on macOS."
         )
-        _emit_status_line(
+        self._emit_status_line(
             "connecting to OpenAI realtime transcription; final output appears as [en ...] and [target ...]."
         )
         if self._config.max_turn_ms > 0:
-            _emit_status_line(
+            self._emit_status_line(
                 f"manual audio commit interval: {self._config.max_turn_ms / 1000:.1f}s."
             )
         if self._config.glossary_file:
@@ -277,7 +296,7 @@ class InterpreterApp:
         try:
             await self._wait_for_stream_ready(stream_task, stream_ready)
             await input_source.start()
-            _emit_status_line(
+            self._emit_status_line(
                 "streaming input now; final output appears as [en ...] and [target ...]."
             )
             await self._continuous_listen_loop(
@@ -402,7 +421,7 @@ class InterpreterApp:
                     utterance_queue.qsize(),
                 )
 
-            _emit_console_line("en", next_sequence_id, english_text)
+            self._emit_console_line("en", next_sequence_id, english_text)
             await utterance_queue.put(
                 QueuedUtterance(
                     sequence_id=next_sequence_id,
@@ -489,7 +508,7 @@ class InterpreterApp:
                 translate_started = time.monotonic()
                 translated_text = await translator.translate_text(utterance.english_text)
                 translate_elapsed_ms = (time.monotonic() - translate_started) * 1000
-                _emit_console_line("target", utterance.sequence_id, translated_text)
+                self._emit_console_line("target", utterance.sequence_id, translated_text)
 
                 if tts is not None and speaker is not None:
                     tts_metrics = await tts.stream_to_speaker(translated_text, speaker)

@@ -87,8 +87,8 @@ def build_parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         default="run",
-        choices=("run", "doctor", "devices", "stop", "status"),
-        help="Run the interpreter loop, verify local setup, or control a running instance.",
+        choices=("run", "gui", "doctor", "devices", "stop", "status"),
+        help="Run the interpreter loop, launch the GUI, verify setup, or control a running instance.",
     )
     parser.add_argument(
         "--openai-project",

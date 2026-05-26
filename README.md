@@ -98,6 +98,19 @@ If you want speech playback, enable it explicitly:
 .venv/bin/python -m interpreter_openai run --enable-tts
 ```
 
+You can also launch the desktop GUI:
+
+```bash
+.venv/bin/python -m interpreter_openai gui
+```
+
+The GUI lets you choose the input source, starts with a Maono device selected
+when one is visible, otherwise prefers the built-in MacBook microphone, and
+then falls back to the system default input. Click `Start` to begin
+transcription and translation. The same button becomes `Stop` while the
+interpreter is running. Closing the window or clicking `Quit` asks for
+confirmation if transcription is still active.
+
 By default, the target language is Mandarin Chinese. You can change it, for
 example to Korean:
 

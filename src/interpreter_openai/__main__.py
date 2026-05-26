@@ -33,8 +33,15 @@ async def _run(config) -> int:
 
 def main() -> None:
     config = parse_args()
-    configure_logging(level=logging.WARNING if config.command == "run" else logging.INFO)
+    configure_logging(
+        level=logging.WARNING if config.command in {"run", "gui"} else logging.INFO
+    )
     try:
+        if config.command == "gui":
+            from .gui import run_gui
+
+            run_gui(config)
+            raise SystemExit(0)
         if config.command == "run":
             with InstanceLock():
                 raise SystemExit(asyncio.run(_run(config)))
