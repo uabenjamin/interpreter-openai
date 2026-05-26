@@ -74,9 +74,14 @@ def build_translation_instructions(
         "- Return only the translation.",
         "- Do not explain, summarize, annotate, or add stage directions.",
         "- If previous context is provided, use it only for continuity and translate only the current segment.",
+        "- The English input is live speech recognition and may contain obvious homophones or misheard words; correct only clear errors from church, sermon, or Bible context before translating.",
+        "- If the source text is genuinely unclear, translate conservatively and do not invent details.",
         "- Preserve theological meaning exactly.",
         f"- Prefer natural spoken {target_language_label} suitable for live interpretation.",
         f"- Use standard Christian terminology appropriate for {target_language_label}.",
+        "- For church announcements, preserve concrete details exactly: dates, times, room names, ministry names, registration instructions, and people's names.",
+        "- For announcements, use clear and natural church announcement wording rather than literal word-by-word phrasing.",
+        "- If a person, church, ministry, room, or event name is uncertain, keep the English name rather than guessing a translated name.",
         "- Preserve scripture references clearly and naturally.",
         "- Do not invent book names, chapter numbers, verse numbers, or missing clauses.",
         "- When the current segment quotes or closely paraphrases Scripture, preserve the biblical meaning and register rather than simplifying it.",
@@ -90,6 +95,7 @@ def build_translation_instructions(
             [
                 "- Prefer standard Mandarin suitable for live church interpretation.",
                 "- Use standard Chinese Christian terminology.",
+                "- In announcements, prefer natural Mandarin such as '报名', '洗礼与会籍课程', '音响培训', '青年室', and '崇拜结束后' when those meanings are present.",
                 "- For recognizable Bible quotations, prefer Mandarin wording familiar to Chinese Protestant congregations, especially Chinese Union Version style when it fits.",
             ]
         )

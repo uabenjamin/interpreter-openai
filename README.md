@@ -112,6 +112,53 @@ default device, pin the device explicitly by name or a unique substring:
 .venv/bin/python -m interpreter_openai run --input-device Maono
 ```
 
+For repeatable testing from a recorded service or online video, first extract
+the audio to a local 16-bit PCM WAV file, then use `--input-audio-file`:
+
+```bash
+.venv/bin/python -m interpreter_openai run \
+  --input-audio-file ~/Downloads/service-test.wav \
+  --glossary-file resources/sermon_glossary.sample.csv \
+  --translation-notes-file resources/sermon_translation_notes.sample.md
+```
+
+The app currently reads local WAV files directly. It does not download online
+videos itself. If you have permission to use the video, use a downloader such
+as `yt-dlp` and convert/extract with `ffmpeg`, for example:
+
+```bash
+yt-dlp -x --audio-format wav -o ~/Downloads/service-test.%(ext)s "VIDEO_URL"
+ffmpeg -i ~/Downloads/service-test.wav -ac 1 -ar 24000 -sample_fmt s16 ~/Downloads/service-test-24k.wav
+```
+
+Then pass `~/Downloads/service-test-24k.wav` to `--input-audio-file`.
+
+If you want to play an online video in the browser and have the app listen to
+that playback live, route macOS system audio into a virtual input device. On
+macOS, a common free option is BlackHole 2ch; a paid option with a simpler app
+UI is Rogue Amoeba Loopback.
+
+Recommended BlackHole setup:
+
+1. Install BlackHole 2ch.
+2. Open `Audio MIDI Setup`.
+3. Create a `Multi-Output Device` that includes your headphones/speakers and
+   `BlackHole 2ch`.
+4. Set macOS sound output to that `Multi-Output Device`.
+5. Play the online video.
+6. Run the interpreter with BlackHole as the input:
+
+```bash
+.venv/bin/python -m interpreter_openai run \
+  --input-device "BlackHole 2ch" \
+  --glossary-file resources/sermon_glossary.sample.csv \
+  --translation-notes-file resources/sermon_translation_notes.sample.md
+```
+
+Use `.venv/bin/python -m interpreter_openai devices` to confirm the exact
+virtual device name. This path captures whatever macOS is playing, so it is
+good for quick testing but less controlled than `--input-audio-file`.
+
 If you also want translated speech to go back out through the interface:
 
 ```bash
@@ -122,18 +169,22 @@ If you also want translated speech to go back out through the interface:
 ```
 
 If the incoming feed contains some background bed or room rumble, you can also
-enable a local speech-focused prefilter before audio is sent to OpenAI:
+enable OpenAI far-field noise reduction plus a local speech-focused prefilter
+before audio is sent to OpenAI:
 
 ```bash
 .venv/bin/python -m interpreter_openai run \
   --input-device Maono \
-  --speech-filter-mode voice_focus
+  --noise-reduction-mode far_field \
+  --speech-filter-mode voice_focus \
+  --max-turn-ms 3000
 ```
 
 This is a limited mitigation, not true source separation. If speech and music
 are already mixed together on the same bus, no simple filter can fully remove
 the music. The best live setup is a dedicated mixer send that contains the
-pastor mic and excludes the music channels.
+pastor mic and excludes the music channels. If possible, send a post-EQ direct
+out or aux mix with only the pastor's microphone into the Maono USB input.
 
 To stop it from the terminal, use `Control-C`.
 
@@ -183,6 +234,9 @@ Finalized English fragments are now buffered before translation. Instead of
 translating every committed fragment immediately, the app waits for sentence
 punctuation, a short idle gap, or a max buffer age, which produces more
 coherent translated output when the speaker talks in long flowing clauses.
+The buffer also holds obvious incomplete clauses a little longer, such as
+segments ending with "for", "to", "if you are interested", or "both for", so
+announcements are less likely to be translated mid-sentence.
 
 For another realtime transcription model that supports server-side turn
 detection, you can run:
@@ -241,6 +295,11 @@ inject a glossary file directly into the model instructions. It also sends a
 short rolling sermon context with each translation request so split Bible
 quotes, pronouns, and repeated theological terms are translated more
 consistently. Only the current segment is translated.
+
+The translation prompt also tells the model that the English text is live ASR
+and may contain obvious homophones or misheard church/Bible terms. It should
+correct only clear context errors before translating, while avoiding invented
+details.
 
 The sample glossary is:
 

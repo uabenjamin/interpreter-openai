@@ -34,6 +34,7 @@ class AppConfig:
     realtime_session_model: str
     source_language: str
     target_language_label: str
+    input_audio_file: Path | None
     input_device: str | None
     output_device: str | None
     transcription_model: str
@@ -129,6 +130,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional microphone device name or unique substring, for example "
             "'Maono'. Defaults to the system default input device."
+        ),
+    )
+    parser.add_argument(
+        "--input-audio-file",
+        "--input-file",
+        dest="input_audio_file",
+        type=Path,
+        default=_optional_path(os.getenv("INTERPRETER_OPENAI_INPUT_AUDIO_FILE")),
+        help=(
+            "Optional local WAV file to use instead of the microphone. "
+            "Use this for repeatable tests with audio extracted from online videos."
         ),
     )
     parser.add_argument(
@@ -367,6 +379,7 @@ def parse_args(argv: list[str] | None = None) -> AppConfig:
         realtime_session_model=args.realtime_session_model,
         source_language=args.source_language,
         target_language_label=args.target_language_label,
+        input_audio_file=args.input_audio_file.expanduser() if args.input_audio_file else None,
         input_device=args.input_device,
         output_device=args.output_device,
         transcription_model=args.transcription_model,

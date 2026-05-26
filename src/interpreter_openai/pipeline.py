@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from .audio_io import (
+    AudioFileCapture,
     AudioUnavailableError,
     MicrophoneCapture,
     SpeakerPlayback,
@@ -30,10 +31,74 @@ from .translator import OpenAITranslator
 
 
 LOGGER = logging.getLogger(__name__)
+INCOMPLETE_TRAILING_WORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "because",
+    "before",
+    "both",
+    "but",
+    "by",
+    "for",
+    "from",
+    "if",
+    "in",
+    "into",
+    "like",
+    "nor",
+    "of",
+    "or",
+    "so",
+    "that",
+    "the",
+    "through",
+    "to",
+    "toward",
+    "towards",
+    "until",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "whom",
+    "whose",
+    "with",
+    "without",
+}
+INCOMPLETE_TRAILING_PHRASES = (
+    "as we",
+    "both for",
+    "called to",
+    "come and",
+    "give you some",
+    "if you are interested",
+    "in order to",
+    "is about",
+    "not only",
+    "so that",
+    "the meaning of",
+    "those of",
+    "those who",
+    "we are to",
+    "we can",
+    "we need to",
+    "we want to",
+    "we're going to",
+    "you can",
+    "you need to",
+)
 
 
 def _emit_console_line(label: str, sequence_id: int, text: str) -> None:
     print(f"[{label} {sequence_id}] {text}", flush=True)
+
+
+def _emit_status_line(text: str) -> None:
+    print(f"[status] {text}", flush=True)
 
 
 @dataclass(slots=True)
@@ -102,17 +167,32 @@ class InterpreterApp:
                 max_gain=self._config.playback_max_gain,
             )
 
-        try:
-            microphone_name = get_selected_microphone_name(self._config.input_device)
-        except AudioUnavailableError as exc:
-            raise UserFacingError(str(exc)) from exc
-        LOGGER.info("Using microphone: %s", microphone_name)
+        if self._config.input_audio_file is not None:
+            input_source_label = str(self._config.input_audio_file)
+            LOGGER.info("Using input audio file: %s", input_source_label)
+            _emit_status_line(f"input audio file: {input_source_label}")
+        else:
+            try:
+                microphone_name = get_selected_microphone_name(self._config.input_device)
+            except AudioUnavailableError as exc:
+                raise UserFacingError(str(exc)) from exc
+            input_source_label = microphone_name
+            LOGGER.info("Using microphone: %s", microphone_name)
+            _emit_status_line(f"input device: {microphone_name}")
         if self._config.enable_tts:
             try:
                 speaker_name = get_selected_speaker_name(self._config.output_device)
             except AudioUnavailableError as exc:
                 raise UserFacingError(str(exc)) from exc
             LOGGER.info("Using speaker: %s", speaker_name)
+            _emit_status_line(f"output device: {speaker_name}")
+        else:
+            if self._config.output_device:
+                _emit_status_line(
+                    "TTS is disabled, so --output-device is ignored. Add --enable-tts for speaker output."
+                )
+            else:
+                _emit_status_line("TTS is disabled; translated text will print to stdout only.")
         LOGGER.info("Realtime transcription model: %s", self._config.transcription_model)
         LOGGER.info(
             "Turn detection: %s%s",
@@ -136,6 +216,13 @@ class InterpreterApp:
             "Listening continuously. Use Control-C to stop. Command-C usually "
             "copies text and does not stop terminal apps on macOS."
         )
+        _emit_status_line(
+            "connecting to OpenAI realtime transcription; final output appears as [en ...] and [target ...]."
+        )
+        if self._config.max_turn_ms > 0:
+            _emit_status_line(
+                f"manual audio commit interval: {self._config.max_turn_ms / 1000:.1f}s."
+            )
         if self._config.glossary_file:
             LOGGER.info("Glossary file: %s", self._config.glossary_file.expanduser())
         if self._config.translation_notes_file:
@@ -146,23 +233,32 @@ class InterpreterApp:
 
         transcript_queue: asyncio.Queue[TranscriptUpdate] = asyncio.Queue()
         utterance_queue: asyncio.Queue[QueuedUtterance | None] = asyncio.Queue()
-        microphone = MicrophoneCapture(
-            device_name=self._config.input_device,
-            capture_sample_rate_hz=self._config.capture_sample_rate_hz,
-            output_sample_rate_hz=self._config.sample_rate_hz,
-            capture_chunk_frames=self._config.capture_chunk_frames,
-            speech_filter_config=SpeechFilterConfig(
-                mode=self._config.speech_filter_mode,
-                sample_rate_hz=self._config.sample_rate_hz,
-                highpass_hz=self._config.speech_filter_highpass_hz,
-                lowpass_hz=self._config.speech_filter_lowpass_hz,
-                gate_threshold=self._config.speech_filter_gate_threshold,
-                gate_floor=self._config.speech_filter_gate_floor,
-            ),
+        speech_filter_config = SpeechFilterConfig(
+            mode=self._config.speech_filter_mode,
+            sample_rate_hz=self._config.sample_rate_hz,
+            highpass_hz=self._config.speech_filter_highpass_hz,
+            lowpass_hz=self._config.speech_filter_lowpass_hz,
+            gate_threshold=self._config.speech_filter_gate_threshold,
+            gate_floor=self._config.speech_filter_gate_floor,
         )
+        if self._config.input_audio_file is not None:
+            input_source = AudioFileCapture(
+                path=self._config.input_audio_file,
+                output_sample_rate_hz=self._config.sample_rate_hz,
+                output_chunk_frames=self._config.chunk_frames,
+                speech_filter_config=speech_filter_config,
+            )
+        else:
+            input_source = MicrophoneCapture(
+                device_name=self._config.input_device,
+                capture_sample_rate_hz=self._config.capture_sample_rate_hz,
+                output_sample_rate_hz=self._config.sample_rate_hz,
+                capture_chunk_frames=self._config.capture_chunk_frames,
+                speech_filter_config=speech_filter_config,
+            )
 
         async def audio_source() -> AsyncIterator[bytes]:
-            async for chunk in microphone.chunks():
+            async for chunk in input_source.chunks():
                 yield chunk
 
         stream_ready = asyncio.Event()
@@ -180,7 +276,10 @@ class InterpreterApp:
 
         try:
             await self._wait_for_stream_ready(stream_task, stream_ready)
-            await microphone.start()
+            await input_source.start()
+            _emit_status_line(
+                "streaming input now; final output appears as [en ...] and [target ...]."
+            )
             await self._continuous_listen_loop(
                 transcript_queue,
                 utterance_queue,
@@ -188,7 +287,7 @@ class InterpreterApp:
                 playback_task,
             )
         finally:
-            await microphone.stop()
+            await input_source.stop()
             done, _ = await asyncio.wait({stream_task}, timeout=5)
             if stream_task in done:
                 await stream_task
@@ -201,21 +300,27 @@ class InterpreterApp:
                 await playback_task
 
     async def doctor(self) -> None:
-        try:
-            microphone_name = get_selected_microphone_name(self._config.input_device)
-        except AudioUnavailableError as exc:
-            LOGGER.warning("Audio device check failed: %s", exc)
+        if self._config.input_audio_file is not None:
+            if self._config.input_audio_file.exists() and self._config.input_audio_file.is_file():
+                LOGGER.info("Input audio file: %s", self._config.input_audio_file)
+            else:
+                LOGGER.warning("Input audio file is not readable: %s", self._config.input_audio_file)
         else:
-            label = "Selected microphone" if self._config.input_device else "Default microphone"
-            LOGGER.info("%s: %s", label, microphone_name)
-            if self._config.enable_tts:
-                try:
-                    speaker_name = get_selected_speaker_name(self._config.output_device)
-                except AudioUnavailableError as exc:
-                    LOGGER.warning("Speaker check failed: %s", exc)
-                else:
-                    label = "Selected speaker" if self._config.output_device else "Default speaker"
-                    LOGGER.info("%s: %s", label, speaker_name)
+            try:
+                microphone_name = get_selected_microphone_name(self._config.input_device)
+            except AudioUnavailableError as exc:
+                LOGGER.warning("Audio device check failed: %s", exc)
+            else:
+                label = "Selected microphone" if self._config.input_device else "Default microphone"
+                LOGGER.info("%s: %s", label, microphone_name)
+        if self._config.enable_tts:
+            try:
+                speaker_name = get_selected_speaker_name(self._config.output_device)
+            except AudioUnavailableError as exc:
+                LOGGER.warning("Speaker check failed: %s", exc)
+            else:
+                label = "Selected speaker" if self._config.output_device else "Default speaker"
+                LOGGER.info("%s: %s", label, speaker_name)
 
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -313,7 +418,15 @@ class InterpreterApp:
             if playback_task.done():
                 await playback_task
                 raise RuntimeError("Playback worker stopped unexpectedly.")
-            if stream_task.done():
+            if stream_task.done() and self._config.input_audio_file is not None:
+                await stream_task
+                if not transcript_queue.empty():
+                    pass
+                else:
+                    await flush_buffered_english()
+                    await utterance_queue.join()
+                    return
+            elif stream_task.done():
                 await stream_task
                 raise RuntimeError("Realtime transcription stream ended unexpectedly.")
 
@@ -446,6 +559,19 @@ class InterpreterApp:
 
         if self._ends_with_sentence_punctuation(text):
             return True
+
+        if self._looks_like_incomplete_clause(text):
+            extended_idle_ms = max(self._config.translation_buffer_silence_ms * 4, 3500)
+            extended_age_ms = max(
+                int(self._config.translation_buffer_max_ms * 1.5),
+                self._config.translation_buffer_max_ms + self._config.max_turn_ms,
+            )
+            if word_count >= self._config.translation_min_words and age_ms >= extended_age_ms:
+                return True
+            if idle_ms >= extended_idle_ms:
+                return True
+            return False
+
         if (
             word_count >= self._config.translation_min_words
             and idle_ms >= self._config.translation_buffer_silence_ms
@@ -462,6 +588,23 @@ class InterpreterApp:
 
     def _ends_with_sentence_punctuation(self, text: str) -> bool:
         return bool(re.search(r"[.!?。！？][\"')\]]*$", text)) or text.endswith("...")
+
+    def _looks_like_incomplete_clause(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if stripped.endswith((",", ";", ":", "-", "–", "—")):
+            return True
+
+        normalized = re.sub(r"[^a-z0-9'\s]+$", "", stripped.lower()).strip()
+        if not normalized:
+            return False
+        words = re.findall(r"\b[\w']+\b", normalized)
+        if not words:
+            return False
+        if words[-1] in INCOMPLETE_TRAILING_WORDS:
+            return True
+        return any(normalized.endswith(phrase) for phrase in INCOMPLETE_TRAILING_PHRASES)
 
     def _word_count(self, text: str) -> int:
         return len(re.findall(r"\b[\w']+\b", text))

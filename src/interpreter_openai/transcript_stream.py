@@ -17,6 +17,7 @@ from .error_handling import UserFacingError
 
 LOGGER = logging.getLogger(__name__)
 TRANSCRIPTION_WEBSOCKET_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
+MANUAL_COMMIT_TIMEOUT_SECONDS = 8.0
 
 
 @dataclass(slots=True)
@@ -34,6 +35,8 @@ class OpenAIRealtimeTranscriber:
         self._speech_active = False
         self._turn_started_at: float | None = None
         self._manual_commit_pending = False
+        self._manual_commit_sent_at: float | None = None
+        self._manual_commit_timeout_warning_emitted = False
         self._buffered_chunk_count = 0
 
     async def stream_audio(
@@ -45,6 +48,8 @@ class OpenAIRealtimeTranscriber:
         self._speech_active = False
         self._turn_started_at = None
         self._manual_commit_pending = False
+        self._manual_commit_sent_at = None
+        self._manual_commit_timeout_warning_emitted = False
         self._buffered_chunk_count = 0
         async with self._connect_transcription() as connection:
             await self._send_event(connection, self._transcription_session_update())
@@ -58,8 +63,17 @@ class OpenAIRealtimeTranscriber:
 
             done, pending = await asyncio.wait(
                 tasks,
-                return_when=asyncio.FIRST_EXCEPTION,
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            if sender in done and sender.exception() is None:
+                await sender
+                await asyncio.sleep(max(3.0, (self._config.max_turn_ms / 1000) + 2.0))
+                for task in pending:
+                    task.cancel()
+                for task in pending:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                return
             for task in pending:
                 task.cancel()
             for task in done:
@@ -206,6 +220,11 @@ class OpenAIRealtimeTranscriber:
             if chunks_sent == 1:
                 LOGGER.info("Streaming microphone audio to OpenAI.")
 
+        if chunks_sent > 0 and self._buffered_audio_ms() >= 250 and not self._manual_commit_pending:
+            self._manual_commit_pending = True
+            self._manual_commit_sent_at = asyncio.get_running_loop().time()
+            await self._send_event(connection, {"type": "input_audio_buffer.commit"})
+
     async def _receive_events(
         self,
         connection: ClientConnection,
@@ -244,11 +263,12 @@ class OpenAIRealtimeTranscriber:
                 continue
 
             if event_type == "input_audio_buffer.committed":
+                self._manual_commit_pending = False
+                self._manual_commit_sent_at = None
                 item_id = str(self._event_field(event, "item_id", "") or "")
                 if not item_id:
                     continue
                 previous_item_id = self._event_field(event, "previous_item_id")
-                self._manual_commit_pending = False
                 self._buffered_chunk_count = 0
                 self._turn_started_at = (
                     asyncio.get_running_loop().time()
@@ -293,6 +313,11 @@ class OpenAIRealtimeTranscriber:
                 continue
 
             if event_type == "conversation.item.input_audio_transcription.completed":
+                self._manual_commit_pending = False
+                self._manual_commit_sent_at = None
+                self._buffered_chunk_count = 0
+                if not self._uses_server_turn_detection():
+                    self._turn_started_at = asyncio.get_running_loop().time()
                 item_id = str(self._event_field(event, "item_id", "") or "")
                 transcript = str(self._event_field(event, "transcript", "") or "").strip()
                 if not item_id:
@@ -310,17 +335,37 @@ class OpenAIRealtimeTranscriber:
                 continue
 
             if event_type == "conversation.item.input_audio_transcription.failed":
+                self._manual_commit_pending = False
+                self._manual_commit_sent_at = None
+                self._buffered_chunk_count = 0
+                if not self._uses_server_turn_detection():
+                    self._turn_started_at = asyncio.get_running_loop().time()
+                item_id = str(self._event_field(event, "item_id", "") or "")
                 error = self._event_field(event, "error")
-                message = (
-                    self._error_field(error, "message")
-                    or "Unknown transcription failure."
+                LOGGER.warning(
+                    "Input audio transcription failed%s: %s",
+                    f" for {item_id}" if item_id else "",
+                    self._format_transcription_failure(error),
                 )
-                LOGGER.warning("Input audio transcription failed: %s", message)
+                if item_id:
+                    partial_text_by_item.pop(item_id, None)
+                    completed_text_by_item.pop(item_id, None)
+                    pending_commits.pop(item_id, None)
+                    commit_index.pop(item_id, None)
+                    emitted_items.add(item_id)
+                    await self._emit_ready_completed(
+                        transcript_queue,
+                        pending_commits,
+                        commit_index,
+                        completed_text_by_item,
+                        emitted_items,
+                    )
                 continue
 
             if event_type == "error":
                 if self._is_benign_small_commit_error(event):
                     self._manual_commit_pending = False
+                    self._manual_commit_sent_at = None
                     if self._speech_active or not self._uses_server_turn_detection():
                         self._turn_started_at = asyncio.get_running_loop().time()
                     LOGGER.debug(
@@ -333,6 +378,20 @@ class OpenAIRealtimeTranscriber:
         while True:
             await asyncio.sleep(0.2)
             if self._manual_commit_pending:
+                pending_seconds = self._manual_commit_pending_seconds()
+                if pending_seconds < MANUAL_COMMIT_TIMEOUT_SECONDS:
+                    continue
+                self._manual_commit_pending = False
+                self._manual_commit_sent_at = None
+                self._turn_started_at = asyncio.get_running_loop().time()
+                if not self._manual_commit_timeout_warning_emitted:
+                    LOGGER.warning(
+                        "Realtime transcription commit was pending for %.1fs. "
+                        "Recovering so audio commits can continue. If this happens "
+                        "with background music, use a mixer send with pastor mic only.",
+                        pending_seconds,
+                    )
+                    self._manual_commit_timeout_warning_emitted = True
                 continue
             if self._turn_started_at is None:
                 self._turn_started_at = asyncio.get_running_loop().time()
@@ -350,6 +409,7 @@ class OpenAIRealtimeTranscriber:
                 continue
 
             self._manual_commit_pending = True
+            self._manual_commit_sent_at = asyncio.get_running_loop().time()
             LOGGER.info(
                 "Forcing audio commit after %.1fs of continuous speech.",
                 elapsed_ms / 1000,
@@ -358,6 +418,7 @@ class OpenAIRealtimeTranscriber:
                 await self._send_event(connection, {"type": "input_audio_buffer.commit"})
             except Exception:
                 self._manual_commit_pending = False
+                self._manual_commit_sent_at = None
                 raise
 
     async def _emit_ready_completed(
@@ -404,8 +465,20 @@ class OpenAIRealtimeTranscriber:
             return f"OpenAI realtime error: {message}"
         return f"OpenAI realtime error: {event}"
 
+    def _format_transcription_failure(self, error) -> str:
+        message = self._error_field(error, "message")
+        code = self._error_field(error, "code")
+        error_type = self._error_field(error, "type")
+        details = [str(value) for value in (message, code, error_type) if value]
+        return " | ".join(details) if details else "Unknown transcription failure."
+
     def _buffered_audio_ms(self) -> int:
         return self._buffered_chunk_count * self._config.chunk_duration_ms
+
+    def _manual_commit_pending_seconds(self) -> float:
+        if self._manual_commit_sent_at is None:
+            return 0.0
+        return asyncio.get_running_loop().time() - self._manual_commit_sent_at
 
     def _uses_server_turn_detection(self) -> bool:
         return self._build_turn_detection() is not None

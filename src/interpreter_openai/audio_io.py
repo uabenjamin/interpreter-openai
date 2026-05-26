@@ -5,8 +5,10 @@ import contextlib
 import logging
 import threading
 import time
+import wave
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import soundcard as sc
@@ -331,12 +333,18 @@ class MicrophoneCapture:
         self._stop_event = threading.Event()
         self._task: asyncio.Task[None] | None = None
         self._overflow_warning_emitted = False
+        self._silence_warning_emitted = False
+        self._capture_started_at: float | None = None
+        self._peak_rms_since_start = 0.0
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._queue = asyncio.Queue(maxsize=128)
         self._stop_event.clear()
         self._overflow_warning_emitted = False
+        self._silence_warning_emitted = False
+        self._capture_started_at = None
+        self._peak_rms_since_start = 0.0
         self._started_event.set()
         self._task = asyncio.create_task(asyncio.to_thread(self._capture_loop))
 
@@ -390,12 +398,37 @@ class MicrophoneCapture:
                         input_sample_rate_hz=self._capture_sample_rate_hz,
                         output_sample_rate_hz=self._output_sample_rate_hz,
                     )
+                    self._track_input_level(frames, microphone)
                     if self._speech_preprocessor is not None:
                         frames = self._speech_preprocessor.process(frames)
                     chunk = float_audio_to_pcm16_bytes(frames)
                     self._loop.call_soon_threadsafe(self._queue_chunk, chunk)
         finally:
             self._loop.call_soon_threadsafe(self._queue_chunk, None)
+
+    def _track_input_level(self, frames: np.ndarray, microphone: object) -> None:
+        now = time.monotonic()
+        if self._capture_started_at is None:
+            self._capture_started_at = now
+
+        if frames.size:
+            samples = frames[:, 0] if frames.ndim == 2 else frames
+            rms = float(np.sqrt(np.mean(np.square(samples), dtype=np.float64)))
+            self._peak_rms_since_start = max(self._peak_rms_since_start, rms)
+
+        if self._silence_warning_emitted:
+            return
+        if now - self._capture_started_at < 8.0:
+            return
+        if self._peak_rms_since_start >= 0.002:
+            return
+
+        LOGGER.warning(
+            "Input from %s is nearly silent. Check the mixer send, Maono gain, "
+            "macOS input selection, and whether the pastor mic is routed to this USB input.",
+            _describe_device(microphone, "Microphone"),
+        )
+        self._silence_warning_emitted = True
 
     def _queue_chunk(self, chunk: bytes | None) -> None:
         if self._queue is None:
@@ -414,6 +447,101 @@ class MicrophoneCapture:
                 )
                 self._overflow_warning_emitted = True
         self._queue.put_nowait(chunk)
+
+
+class AudioFileCapture:
+    def __init__(
+        self,
+        path: Path,
+        output_sample_rate_hz: int,
+        output_chunk_frames: int,
+        speech_filter_config: SpeechFilterConfig | None = None,
+        realtime: bool = True,
+    ) -> None:
+        self._path = path.expanduser()
+        self._output_sample_rate_hz = output_sample_rate_hz
+        self._output_chunk_frames = output_chunk_frames
+        self._speech_preprocessor = (
+            SpeechAudioPreprocessor(speech_filter_config)
+            if speech_filter_config is not None
+            else None
+        )
+        self._realtime = realtime
+        self._stop = False
+        self._started_event = asyncio.Event()
+
+    async def start(self) -> None:
+        if not self._path.exists():
+            raise AudioUnavailableError(f"Input audio file not found: {self._path}")
+        if not self._path.is_file():
+            raise AudioUnavailableError(f"Input audio path is not a file: {self._path}")
+        self._stop = False
+        self._started_event.set()
+
+    async def stop(self) -> None:
+        self._stop = True
+
+    async def chunks(self) -> AsyncIterator[bytes]:
+        await self._started_event.wait()
+        try:
+            with wave.open(str(self._path), "rb") as audio_file:
+                channels = audio_file.getnchannels()
+                sample_width = audio_file.getsampwidth()
+                input_sample_rate_hz = audio_file.getframerate()
+                if sample_width != 2:
+                    raise AudioUnavailableError(
+                        "Only 16-bit PCM WAV files are supported for --input-audio-file. "
+                        "Convert the file to WAV with 16-bit PCM first."
+                    )
+
+                input_chunk_frames = max(
+                    1,
+                    int(
+                        round(
+                            self._output_chunk_frames
+                            * input_sample_rate_hz
+                            / self._output_sample_rate_hz
+                        )
+                    ),
+                )
+                LOGGER.info(
+                    "Reading audio file %s at %s Hz, %s channel(s), streaming as %s Hz PCM.",
+                    self._path,
+                    input_sample_rate_hz,
+                    channels,
+                    self._output_sample_rate_hz,
+                )
+
+                while not self._stop:
+                    raw = audio_file.readframes(input_chunk_frames)
+                    if not raw:
+                        break
+
+                    data = self._pcm16_bytes_to_float_audio(raw, channels)
+                    data = resample_float_audio(
+                        data,
+                        input_sample_rate_hz=input_sample_rate_hz,
+                        output_sample_rate_hz=self._output_sample_rate_hz,
+                    )
+                    if self._speech_preprocessor is not None:
+                        data = self._speech_preprocessor.process(data)
+                    yield float_audio_to_pcm16_bytes(data)
+
+                    if self._realtime:
+                        await asyncio.sleep(
+                            max(0.0, len(data) / self._output_sample_rate_hz)
+                        )
+        except wave.Error as exc:
+            raise AudioUnavailableError(
+                f"Could not read WAV input audio file {self._path}: {exc}"
+            ) from exc
+
+    def _pcm16_bytes_to_float_audio(self, audio_bytes: bytes, channels: int) -> np.ndarray:
+        samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        if channels > 1:
+            complete_samples = len(samples) - (len(samples) % channels)
+            samples = samples[:complete_samples].reshape(-1, channels).mean(axis=1)
+        return samples.reshape(-1, 1)
 
 
 class SpeakerPlayback:
