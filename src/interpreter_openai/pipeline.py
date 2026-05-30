@@ -74,22 +74,47 @@ INCOMPLETE_TRAILING_PHRASES = (
     "both for",
     "called to",
     "come and",
+    "come a day when",
+    "every mouth will",
+    "every tongue",
+    "every tongue every mouth",
+    "get into",
     "give you some",
+    "he is who he",
     "if you are interested",
     "in order to",
     "is about",
+    "is who he",
+    "it is",
+    "it's",
     "not only",
+    "no voice",
+    "pray for that",
+    "pray that",
     "so that",
     "the meaning of",
     "those of",
     "those who",
+    "to the",
     "we are to",
     "we can",
+    "we don't see",
+    "we do not see",
+    "we give you",
     "we need to",
+    "we pray that",
     "we want to",
     "we're going to",
+    "what we need to hear",
+    "will be no voice",
     "you can",
     "you need to",
+)
+INCOMPLETE_TRAILING_PATTERNS = (
+    re.compile(r"\b(as|when|while|before|after|if|because|that)\s+we$", re.IGNORECASE),
+    re.compile(r"\b(all|some|many|those|the|a|an)\s+\w+$", re.IGNORECASE),
+    re.compile(r"\b(we|you|they|he|she|it|there)\s+(will|would|can|could|may|might|must|should|have|has|are|is|were|was|do|does|did)\s+\w+$", re.IGNORECASE),
+    re.compile(r"\b(will|would|can|could|may|might|must|should|to|for|with|into|about|from|upon)\s+\w+$", re.IGNORECASE),
 )
 
 
@@ -113,10 +138,12 @@ class InterpreterApp:
         config: AppConfig,
         output_handler: Callable[[str, int | None, str], None] | None = None,
         status_handler: Callable[[str], None] | None = None,
+        sermon_reference_text: str | None = None,
     ) -> None:
         self._config = config
         self._output_handler = output_handler
         self._status_handler = status_handler
+        self._sermon_reference_text = sermon_reference_text
 
     def _emit_console_line(self, label: str, sequence_id: int, text: str) -> None:
         if self._output_handler is not None:
@@ -165,6 +192,7 @@ class InterpreterApp:
             target_language_label=self._config.target_language_label,
             glossary_file=self._config.glossary_file,
             translation_notes_file=self._config.translation_notes_file,
+            sermon_reference_text=self._sermon_reference_text,
         )
         transcriber = OpenAIRealtimeTranscriber(self._config, api_key)
         tts: OpenAITTSService | None = None
@@ -249,6 +277,8 @@ class InterpreterApp:
                 "Translation notes file: %s",
                 self._config.translation_notes_file.expanduser(),
             )
+        if self._sermon_reference_text:
+            self._emit_status_line("sermon reference loaded for translation.")
 
         transcript_queue: asyncio.Queue[TranscriptUpdate] = asyncio.Queue()
         utterance_queue: asyncio.Queue[QueuedUtterance | None] = asyncio.Queue()
@@ -576,9 +606,6 @@ class InterpreterApp:
         idle_ms = (now - buffer_last_updated_at) * 1000
         age_ms = (now - buffer_started_at) * 1000
 
-        if self._ends_with_sentence_punctuation(text):
-            return True
-
         if self._looks_like_incomplete_clause(text):
             extended_idle_ms = max(self._config.translation_buffer_silence_ms * 4, 3500)
             extended_age_ms = max(
@@ -590,6 +617,9 @@ class InterpreterApp:
             if idle_ms >= extended_idle_ms:
                 return True
             return False
+
+        if self._ends_with_sentence_punctuation(text):
+            return True
 
         if (
             word_count >= self._config.translation_min_words
@@ -623,7 +653,9 @@ class InterpreterApp:
             return False
         if words[-1] in INCOMPLETE_TRAILING_WORDS:
             return True
-        return any(normalized.endswith(phrase) for phrase in INCOMPLETE_TRAILING_PHRASES)
+        if any(normalized.endswith(phrase) for phrase in INCOMPLETE_TRAILING_PHRASES):
+            return True
+        return any(pattern.search(normalized) for pattern in INCOMPLETE_TRAILING_PATTERNS)
 
     def _word_count(self, text: str) -> int:
         return len(re.findall(r"\b[\w']+\b", text))

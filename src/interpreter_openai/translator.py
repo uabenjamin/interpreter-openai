@@ -20,9 +20,11 @@ class OpenAITranslator:
         target_language_label: str,
         glossary_file,
         translation_notes_file,
+        sermon_reference_text: str | None = None,
     ) -> None:
         glossary_entries = load_glossary_entries(glossary_file)
         translation_notes = load_translation_notes(translation_notes_file)
+        extra_notes = self._combine_notes(translation_notes, sermon_reference_text)
         self._client = client
         self._model = model
         self._max_output_tokens = max_output_tokens
@@ -31,8 +33,20 @@ class OpenAITranslator:
         self._instructions = build_translation_instructions(
             target_language_label,
             glossary_entries,
-            translation_notes,
+            extra_notes,
         )
+
+    def _combine_notes(
+        self,
+        translation_notes: str | None,
+        sermon_reference_text: str | None,
+    ) -> str | None:
+        sections = []
+        if translation_notes:
+            sections.append(translation_notes.strip())
+        if sermon_reference_text:
+            sections.append(sermon_reference_text.strip())
+        return "\n\n".join(section for section in sections if section) or None
 
     async def translate_text(self, english_text: str) -> str:
         return await asyncio.to_thread(self._translate_text_blocking, english_text)

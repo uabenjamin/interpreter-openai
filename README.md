@@ -111,6 +111,19 @@ transcription and translation. The same button becomes `Stop` while the
 interpreter is running. Closing the window or clicking `Quit` asks for
 confirmation if transcription is still active.
 
+The GUI also supports a temporary sermon reference before you click `Start`.
+Use `Paste`, `Upload`, or drag and drop a file onto the reference box. Supported
+reference formats are `.txt`, `.md`, `.markdown`, `.rtf`, `.docx`, and `.pdf`.
+The reference can be summarized once into a compact translation context, or used
+as a raw excerpt. Summarized mode is recommended for live use because it keeps
+translation requests smaller and avoids adding latency to every sentence.
+
+Sermon references are used for translation context only. They help with sermon
+topic, Scripture references, church names, announcements, key terms, and obvious
+ASR correction hints. The current realtime transcription model does not support
+prompting with a sermon draft. References are held in memory and forgotten when
+the app quits.
+
 By default, the target language is Mandarin Chinese. You can change it, for
 example to Korean:
 
