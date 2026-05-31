@@ -114,6 +114,9 @@ class InterpreterWindow(QMainWindow):  # type: ignore[misc]
         self._running = False
         self._stopping = False
         self._reference_busy = False
+        self._config_visible = True
+        self._close_requested = False
+        self._log_handler_removed = False
         self._sermon_reference_text: str | None = None
         self._sermon_reference_source: str | None = None
 
@@ -141,10 +144,6 @@ class InterpreterWindow(QMainWindow):  # type: ignore[misc]
                 color: #1f2933;
                 font-family: "Avenir Next";
             }
-            QLabel#title {
-                font-size: 24px;
-                font-weight: 700;
-            }
             QLabel#subtitle, QLabel#status {
                 color: #52606d;
             }
@@ -152,26 +151,36 @@ class InterpreterWindow(QMainWindow):  # type: ignore[misc]
                 color: #52606d;
                 font-size: 12px;
             }
+            QWidget#configGroup {
+                background: #fbf4e5;
+                border: 1px solid #d8c9a7;
+                border-radius: 10px;
+            }
+            QLabel#groupTitle {
+                color: #3f3a2f;
+                font-size: 13px;
+                font-weight: 700;
+            }
             QLabel#dropZone {
                 background: #fffaf0;
                 border: 1px dashed #b89b5e;
                 border-radius: 8px;
                 color: #6b5b3e;
-                padding: 8px 12px;
+                padding: 6px 10px;
             }
             QComboBox {
                 background: #fffaf0;
                 border: 1px solid #c7bca1;
                 border-radius: 6px;
-                padding: 7px 10px;
-                min-height: 24px;
+                padding: 5px 8px;
+                min-height: 20px;
             }
             QPushButton {
                 background: #1f2933;
                 color: #fffaf0;
                 border: 0;
                 border-radius: 8px;
-                padding: 9px 18px;
+                padding: 7px 12px;
                 font-weight: 700;
             }
             QPushButton:disabled {
@@ -192,41 +201,70 @@ class InterpreterWindow(QMainWindow):  # type: ignore[misc]
 
         root = QWidget()
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
 
-        header = QHBoxLayout()
-        title = QLabel("Live Interpreter")
-        title.setObjectName("title")
-        subtitle = QLabel(f"Target: {self._base_config.target_language_label}")
-        subtitle.setObjectName("subtitle")
-        header.addWidget(title)
-        header.addStretch()
-        header.addWidget(subtitle)
-        layout.addLayout(header)
+        self._config_panel = QWidget()
+        config_layout = QHBoxLayout(self._config_panel)
+        config_layout.setContentsMargins(0, 0, 0, 0)
+        config_layout.setSpacing(10)
 
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Input source"))
+        audio_group = QWidget()
+        audio_group.setObjectName("configGroup")
+        audio_layout = QVBoxLayout(audio_group)
+        audio_layout.setContentsMargins(12, 10, 12, 10)
+        audio_layout.setSpacing(8)
+        audio_title_row = QHBoxLayout()
+        audio_title = QLabel("Audio and Run")
+        audio_title.setObjectName("groupTitle")
+        audio_title_row.addWidget(audio_title)
+        audio_title_row.addStretch()
+        target_label = QLabel(f"Target: {self._base_config.target_language_label}")
+        target_label.setObjectName("subtitle")
+        audio_title_row.addWidget(target_label)
+        audio_layout.addLayout(audio_title_row)
+
+        input_controls = QHBoxLayout()
+        input_controls.addWidget(QLabel("Input"))
         self._input_combo = QComboBox()
-        controls.addWidget(self._input_combo, stretch=1)
+        self._input_combo.setMinimumWidth(220)
+        self._input_combo.setMaximumWidth(360)
+        input_controls.addWidget(self._input_combo, stretch=1)
+        audio_layout.addLayout(input_controls)
 
+        run_controls = QHBoxLayout()
         self._start_stop_button = QPushButton("Start")
         self._start_stop_button.clicked.connect(self._toggle_running)
-        controls.addWidget(self._start_stop_button)
+        run_controls.addWidget(self._start_stop_button)
 
         self._quit_button = QPushButton("Quit")
         self._quit_button.setObjectName("quitButton")
         self._quit_button.clicked.connect(self.close)
-        controls.addWidget(self._quit_button)
-        layout.addLayout(controls)
+        run_controls.addWidget(self._quit_button)
 
-        self._status = QLabel("Select an input source, then click Start.")
+        self._help_button = QPushButton("?")
+        self._help_button.setFixedWidth(34)
+        self._help_button.clicked.connect(self._show_help)
+        run_controls.addWidget(self._help_button)
+        run_controls.addStretch()
+        audio_layout.addLayout(run_controls)
+
+        self._status = QLabel("")
         self._status.setObjectName("status")
         self._status.setWordWrap(True)
-        layout.addWidget(self._status)
+        self._status.setVisible(False)
+        audio_layout.addWidget(self._status)
+
+        reference_group = QWidget()
+        reference_group.setObjectName("configGroup")
+        reference_layout = QVBoxLayout(reference_group)
+        reference_layout.setContentsMargins(12, 10, 12, 10)
+        reference_layout.setSpacing(8)
 
         reference_controls = QHBoxLayout()
-        reference_controls.addWidget(QLabel("Sermon reference"))
+        reference_title = QLabel("Sermon Reference")
+        reference_title.setObjectName("groupTitle")
+        reference_controls.addWidget(reference_title)
         self._reference_mode_combo = QComboBox()
         self._reference_mode_combo.addItems([REFERENCE_MODE_SUMMARY, REFERENCE_MODE_RAW])
         reference_controls.addWidget(self._reference_mode_combo)
@@ -246,15 +284,46 @@ class InterpreterWindow(QMainWindow):  # type: ignore[misc]
         self._reference_status = QLabel("No sermon reference loaded.")
         self._reference_status.setObjectName("referenceStatus")
         reference_controls.addWidget(self._reference_status, stretch=1)
-        layout.addLayout(reference_controls)
+        reference_layout.addLayout(reference_controls)
 
         self._reference_drop_zone = ReferenceDropLabel(self._load_reference_file)
-        layout.addWidget(self._reference_drop_zone)
+        reference_layout.addWidget(self._reference_drop_zone)
+        config_layout.addWidget(audio_group, stretch=1)
+        config_layout.addWidget(reference_group, stretch=2)
+        layout.addWidget(self._config_panel)
+
+        self._running_controls = QWidget()
+        running_layout = QHBoxLayout(self._running_controls)
+        running_layout.setContentsMargins(0, 0, 0, 0)
+        running_layout.setSpacing(8)
+        self._running_stop_button = QPushButton("Stop")
+        self._running_stop_button.clicked.connect(self._toggle_running)
+        running_layout.addWidget(self._running_stop_button)
+        self._running_quit_button = QPushButton("Quit")
+        self._running_quit_button.setObjectName("quitButton")
+        self._running_quit_button.clicked.connect(self.close)
+        running_layout.addWidget(self._running_quit_button)
+        running_layout.addStretch()
+        self._running_controls.setVisible(False)
+        layout.addWidget(self._running_controls)
 
         self._text = QTextEdit()
         self._text.setReadOnly(True)
         layout.addWidget(self._text, stretch=1)
         self.setCentralWidget(root)
+
+    def _show_help(self) -> None:
+        QMessageBox.information(
+            self,
+            "Interpreter Help",
+            (
+                "Choose the input source, optionally load a sermon reference, then click Start.\n\n"
+                "Sermon references can be pasted, uploaded, or dropped into the box. "
+                "They are used for translation context only and are forgotten when the app quits.\n\n"
+                "When interpreting starts, configuration is hidden automatically. "
+                "It returns when you stop."
+            ),
+        )
 
     def _load_input_devices(self) -> None:
         try:
@@ -282,13 +351,22 @@ class InterpreterWindow(QMainWindow):  # type: ignore[misc]
         dialog.setWindowTitle("Paste Sermon Reference")
         dialog.resize(720, 520)
         layout = QVBoxLayout(dialog)
-        label = QLabel(
+        label_text = (
             "Paste sermon manuscript, notes, outline, Scripture passages, or announcements."
         )
+        current_reference = self._sermon_reference_text or ""
+        if current_reference:
+            label_text = (
+                "Current processed reference is shown below. Review it, edit it, "
+                "or replace it with new sermon content."
+            )
+        label = QLabel(label_text)
         label.setWordWrap(True)
         layout.addWidget(label)
         editor = QTextEdit()
         editor.setPlaceholderText("Paste sermon draft or notes here...")
+        if current_reference:
+            editor.setPlainText(current_reference)
         layout.addWidget(editor, stretch=1)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel
@@ -303,6 +381,8 @@ class InterpreterWindow(QMainWindow):  # type: ignore[misc]
         text = editor.toPlainText().strip()
         if not text:
             QMessageBox.warning(self, "Empty Reference", "Paste reference text first.")
+            return
+        if current_reference and text == current_reference.strip():
             return
         self._prepare_reference_from_text("Pasted sermon reference", text)
 
@@ -433,9 +513,10 @@ class InterpreterWindow(QMainWindow):  # type: ignore[misc]
         )
         self._running = True
         self._stopping = False
-        self._start_stop_button.setText("Stop")
+        self._set_start_stop_text("Stop")
         self._input_combo.setEnabled(False)
         self._set_reference_controls_enabled(False)
+        self._set_config_visible(False)
         self._append_status("Starting interpreter...")
         self._set_status("Starting...")
         self._thread = threading.Thread(
@@ -450,8 +531,8 @@ class InterpreterWindow(QMainWindow):  # type: ignore[misc]
         if not self._running or self._stopping:
             return
         self._stopping = True
-        self._set_status("Stopping...")
-        self._start_stop_button.setEnabled(False)
+        self._set_status("Stopping before quitting..." if self._close_requested else "Stopping...")
+        self._set_start_stop_enabled(False)
         self._append_status("Stopping interpreter...")
         loop = self._loop
         task = self._task
@@ -533,12 +614,15 @@ class InterpreterWindow(QMainWindow):  # type: ignore[misc]
             elif event_type == "stopped":
                 self._running = False
                 self._stopping = False
-                self._start_stop_button.setText("Start")
-                self._start_stop_button.setEnabled(True)
+                self._set_start_stop_text("Start")
+                self._set_start_stop_enabled(True)
                 self._input_combo.setEnabled(True)
                 self._set_reference_controls_enabled(not self._reference_busy)
+                self._set_config_visible(True)
                 self._set_status("Stopped.")
                 self._append_status("Interpreter stopped.")
+                if self._close_requested:
+                    QTimer.singleShot(0, self.close)
 
     def _append_output(self, label: str, sequence_id: int, text: str) -> None:
         escaped = html.escape(text)
@@ -575,31 +659,65 @@ class InterpreterWindow(QMainWindow):  # type: ignore[misc]
 
     def _set_status(self, text: str) -> None:
         self._status.setText(text)
+        self._status.setVisible(bool(text.strip()))
+
+    def _set_config_visible(self, visible: bool) -> None:
+        self._config_visible = visible
+        self._config_panel.setVisible(visible)
+        self._running_controls.setVisible(not visible)
+
+    def _set_start_stop_text(self, text: str) -> None:
+        self._start_stop_button.setText(text)
+        self._running_stop_button.setText(text)
+
+    def _set_start_stop_enabled(self, enabled: bool) -> None:
+        self._start_stop_button.setEnabled(enabled)
+        self._running_stop_button.setEnabled(enabled)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API name.
         if self._running:
+            if not self._close_requested:
+                answer = QMessageBox.question(
+                    self,
+                    "Quit Interpreter",
+                    "The interpreter is still running. Stop it and quit?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
+                self._close_requested = True
+            self._stop_interpreter()
+            event.ignore()
+            QTimer.singleShot(400, self._finish_close_when_stopped)
+            return
+        if self._reference_busy and not self._close_requested:
             answer = QMessageBox.question(
                 self,
                 "Quit Interpreter",
-                "The interpreter is still running. Stop it and quit?",
+                "A sermon reference is still being prepared. Quit anyway?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            self._stop_interpreter()
-            event.ignore()
-            QTimer.singleShot(400, self._finish_close_when_stopped)
-            return
-        logging.getLogger().removeHandler(self._log_handler)
+            self._close_requested = True
+        self._remove_log_handler()
         event.accept()
 
     def _finish_close_when_stopped(self) -> None:
-        if self._running:
+        if self._running or self._stopping:
             QTimer.singleShot(200, self._finish_close_when_stopped)
             return
         self.close()
+
+    def _remove_log_handler(self) -> None:
+        if self._log_handler_removed:
+            return
+        logging.getLogger().removeHandler(self._log_handler)
+        self._log_handler_removed = True
 
 
 def run_gui(config: AppConfig) -> None:
