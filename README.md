@@ -327,6 +327,13 @@ and may contain obvious homophones or misheard church/Bible terms. It should
 correct only clear context errors before translating, while avoiding invented
 details.
 
+For Mandarin sermons, the built-in prompt favors natural pulpit language over
+word-for-word translation. It may reorder or split sentences while preserving
+theological meaning, pastoral intent, and rhetorical movement such as comfort,
+exhortation, calls to repentance, repetition, and progressive buildup. It also
+avoids forced Christian vocabulary and devotional phrases not present in the
+English source.
+
 The sample glossary is:
 
 `resources/sermon_glossary.sample.csv`

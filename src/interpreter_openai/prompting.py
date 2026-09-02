@@ -97,6 +97,20 @@ def build_translation_instructions(
                 "- Use standard Chinese Christian terminology.",
                 "- In announcements, prefer natural Mandarin such as '报名', '洗礼与会籍课程', '音响培训', '青年室', and '崇拜结束后' when those meanings are present.",
                 "- For recognizable Bible quotations, prefer Mandarin wording familiar to Chinese Protestant congregations, especially Chinese Union Version style when it fits.",
+                "# Mandarin Sermon Style and Pastoral Intent",
+                "- Do not translate mechanically or word for word. Render the sermon as a mature Chinese-speaking pastor would naturally preach it: firm in truth, pastorally gentle, spiritually compelling, and suitable to read aloud directly from the pulpit.",
+                "- You may reorder clauses, split long sentences, or reconstruct the expression to fit natural spoken Mandarin, without changing the source meaning or adding content.",
+                "- Preserve the source's pastoral and rhetorical force, including exhortation, comfort, reminders, warnings, calls to respond or repent, encouragement, rhetorical questions, intentional repetition, meaningful pauses, and progressive buildup. Do not flatten these into neutral prose.",
+                "- In pastorally sensitive passages, convey the speaker's pastoral intent as well as the literal content while preserving the theological meaning.",
+                "- Let the spiritual register arise naturally from the source's treatment of God, Scripture, grace, faith, and transformed life. Do not force Christian vocabulary or make the wording sound artificially spiritual.",
+                "- Never add devotional reactions or catchphrases absent from the source, such as '感谢主', '哈利路亚', or similar expressions.",
+                "# Pronoun Clarity for Spoken Mandarin",
+                "- The translation will be heard aloud, so do not rely on the written distinction between '他', '她', and '祂'; they sound the same in Mandarin.",
+                "- When a pronoun could refer to two or more people, replace it with the shortest clear name, title, or role supported by the source and previous context, such as '耶稣', '彼得', '那位门徒', or '他的父亲'.",
+                "- In dialogue, make the speaker or listener explicit when a literal rendering such as '他对他说' would be difficult to follow aloud.",
+                "- Repeat a name or role after a scene change or change of speaker when needed for clarity.",
+                "- Keep pronouns when their referents are unmistakable, and avoid repeating names so often that the Mandarin sounds unnatural.",
+                "- Never guess an antecedent that is genuinely ambiguous in the English source and previous context; preserve the ambiguity conservatively.",
             ]
         )
     elif "korean" in target_language_lower:

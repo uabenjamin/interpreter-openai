@@ -5,6 +5,7 @@ import html
 import logging
 import queue
 import threading
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -30,6 +31,7 @@ except ImportError as exc:  # pragma: no cover - depends on local GUI install.
     PYSIDE_IMPORT_ERROR: ImportError | None = exc
     QApplication = None  # type: ignore[assignment]
     QCloseEvent = object  # type: ignore[assignment]
+    QComboBox = object  # type: ignore[assignment]
     QDragEnterEvent = object  # type: ignore[assignment]
     QDropEvent = object  # type: ignore[assignment]
     QLabel = object  # type: ignore[assignment]
@@ -95,6 +97,16 @@ class ReferenceDropLabel(QLabel):  # type: ignore[misc]
                 event.acceptProposedAction()
                 return
         event.ignore()
+
+
+class RefreshingComboBox(QComboBox):  # type: ignore[misc]
+    def __init__(self, refresh_items: Callable[[], None]) -> None:
+        super().__init__()
+        self._refresh_items = refresh_items
+
+    def showPopup(self) -> None:  # noqa: N802 - Qt API name.
+        self._refresh_items()
+        super().showPopup()
 
 
 class InterpreterWindow(QMainWindow):  # type: ignore[misc]
@@ -226,7 +238,7 @@ class InterpreterWindow(QMainWindow):  # type: ignore[misc]
 
         input_controls = QHBoxLayout()
         input_controls.addWidget(QLabel("Input"))
-        self._input_combo = QComboBox()
+        self._input_combo = RefreshingComboBox(self._load_input_devices)
         self._input_combo.setMinimumWidth(220)
         self._input_combo.setMaximumWidth(360)
         input_controls.addWidget(self._input_combo, stretch=1)
@@ -326,6 +338,7 @@ class InterpreterWindow(QMainWindow):  # type: ignore[misc]
         )
 
     def _load_input_devices(self) -> None:
+        selected_input = self._input_combo.currentText().strip()
         try:
             devices = list_microphone_names()
         except AudioUnavailableError as exc:
@@ -339,8 +352,12 @@ class InterpreterWindow(QMainWindow):  # type: ignore[misc]
         for device in devices:
             self._input_combo.addItem(device)
 
-        preferred = self._preferred_input_device(devices)
-        index = self._input_combo.findText(preferred)
+        selection = (
+            selected_input
+            if selected_input == DEFAULT_INPUT_LABEL or selected_input in devices
+            else self._preferred_input_device(devices)
+        )
+        index = self._input_combo.findText(selection)
         self._input_combo.setCurrentIndex(index if index >= 0 else 0)
 
     def _open_paste_reference_dialog(self) -> None:

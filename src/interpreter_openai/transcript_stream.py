@@ -322,7 +322,7 @@ class OpenAIRealtimeTranscriber:
                 transcript = str(self._event_field(event, "transcript", "") or "").strip()
                 if not item_id:
                     continue
-                if transcript:
+                if item_id not in emitted_items:
                     completed_text_by_item[item_id] = transcript
                 partial_text_by_item.pop(item_id, None)
                 await self._emit_ready_completed(
@@ -349,10 +349,11 @@ class OpenAIRealtimeTranscriber:
                 )
                 if item_id:
                     partial_text_by_item.pop(item_id, None)
-                    completed_text_by_item.pop(item_id, None)
-                    pending_commits.pop(item_id, None)
-                    commit_index.pop(item_id, None)
-                    emitted_items.add(item_id)
+                    if item_id not in emitted_items:
+                        # A failed transcription is still a terminal result for this
+                        # committed audio item. Keep it in the ordering queue as an
+                        # empty result so later turns cannot overtake earlier ones.
+                        completed_text_by_item[item_id] = ""
                     await self._emit_ready_completed(
                         transcript_queue,
                         pending_commits,
@@ -430,24 +431,24 @@ class OpenAIRealtimeTranscriber:
         emitted_items: set[str],
     ) -> None:
         while True:
-            ready_items = [
+            pending_items = [
                 item_id
-                for item_id, transcript in completed_text_by_item.items()
-                if transcript
-                and item_id not in emitted_items
-                and (
-                    pending_commits.get(item_id) is None
-                    or pending_commits.get(item_id) in emitted_items
-                )
+                for item_id in pending_commits
+                if item_id not in emitted_items
             ]
-            if not ready_items:
+            if not pending_items:
                 return
 
             next_item_id = min(
-                ready_items,
+                pending_items,
                 key=lambda item_id: commit_index.get(item_id, 1_000_000_000),
             )
+            if next_item_id not in completed_text_by_item:
+                return
+
             emitted_items.add(next_item_id)
+            pending_commits.pop(next_item_id, None)
+            commit_index.pop(next_item_id, None)
             transcript = completed_text_by_item.pop(next_item_id).strip()
             if transcript:
                 await transcript_queue.put(
@@ -456,6 +457,11 @@ class OpenAIRealtimeTranscriber:
                         text=transcript,
                         is_partial=False,
                     )
+                )
+            else:
+                LOGGER.info(
+                    "Audio turn %s produced no transcript; continuing with the next turn.",
+                    next_item_id,
                 )
 
     def _format_error_event(self, event) -> str:

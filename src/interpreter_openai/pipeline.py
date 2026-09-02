@@ -132,6 +132,13 @@ class QueuedUtterance:
     english_text: str
 
 
+@dataclass(slots=True)
+class TranslatedUtterance:
+    sequence_id: int
+    translated_text: str
+    translate_elapsed_ms: float
+
+
 class InterpreterApp:
     def __init__(
         self,
@@ -282,6 +289,9 @@ class InterpreterApp:
 
         transcript_queue: asyncio.Queue[TranscriptUpdate] = asyncio.Queue()
         utterance_queue: asyncio.Queue[QueuedUtterance | None] = asyncio.Queue()
+        translated_audio_queue: asyncio.Queue[TranslatedUtterance | None] | None = None
+        if tts is not None and speaker is not None:
+            translated_audio_queue = asyncio.Queue()
         speech_filter_config = SpeechFilterConfig(
             mode=self._config.speech_filter_mode,
             sample_rate_hz=self._config.sample_rate_hz,
@@ -314,14 +324,25 @@ class InterpreterApp:
         stream_task = asyncio.create_task(
             transcriber.stream_audio(audio_source(), transcript_queue, stream_ready)
         )
-        playback_task = asyncio.create_task(
-            self._translation_playback_worker(
+        translation_task = asyncio.create_task(
+            self._translation_worker(
                 utterance_queue,
                 translator,
-                tts,
-                speaker,
+                translated_audio_queue,
             )
         )
+        audio_playback_task: asyncio.Task[None] | None = None
+        if translated_audio_queue is not None and tts is not None and speaker is not None:
+            audio_playback_task = asyncio.create_task(
+                self._translated_audio_playback_worker(
+                    translated_audio_queue,
+                    tts,
+                    speaker,
+                )
+            )
+        worker_tasks = {translation_task}
+        if audio_playback_task is not None:
+            worker_tasks.add(audio_playback_task)
 
         try:
             await self._wait_for_stream_ready(stream_task, stream_ready)
@@ -333,7 +354,7 @@ class InterpreterApp:
                 transcript_queue,
                 utterance_queue,
                 stream_task,
-                playback_task,
+                worker_tasks,
             )
         finally:
             await input_source.stop()
@@ -346,7 +367,10 @@ class InterpreterApp:
                     await stream_task
             await utterance_queue.put(None)
             with contextlib.suppress(asyncio.CancelledError):
-                await playback_task
+                await translation_task
+            if audio_playback_task is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await audio_playback_task
 
     async def doctor(self) -> None:
         if self._config.input_audio_file is not None:
@@ -427,7 +451,7 @@ class InterpreterApp:
         transcript_queue: asyncio.Queue[TranscriptUpdate],
         utterance_queue: asyncio.Queue[QueuedUtterance | None],
         stream_task: asyncio.Task[None],
-        playback_task: asyncio.Task[None],
+        worker_tasks: set[asyncio.Task[None]],
     ) -> None:
         seen_completed_items: set[str] = set()
         next_sequence_id = 1
@@ -447,7 +471,7 @@ class InterpreterApp:
 
             if utterance_queue.qsize() >= 2:
                 LOGGER.warning(
-                    "Playback queue backlog is %s utterances. Translated audio may lag.",
+                    "Translation queue backlog is %s utterances. Translated output may lag.",
                     utterance_queue.qsize(),
                 )
 
@@ -464,9 +488,10 @@ class InterpreterApp:
             buffer_last_updated_at = None
 
         while True:
-            if playback_task.done():
-                await playback_task
-                raise RuntimeError("Playback worker stopped unexpectedly.")
+            stopped_workers = [task for task in worker_tasks if task.done()]
+            if stopped_workers:
+                await stopped_workers[0]
+                raise RuntimeError("Translation or playback worker stopped unexpectedly.")
             if stream_task.done() and self._config.input_audio_file is not None:
                 await stream_task
                 if not transcript_queue.empty():
@@ -522,16 +547,18 @@ class InterpreterApp:
             ):
                 await flush_buffered_english()
 
-    async def _translation_playback_worker(
+    async def _translation_worker(
         self,
         utterance_queue: asyncio.Queue[QueuedUtterance | None],
         translator: OpenAITranslator,
-        tts: OpenAITTSService | None,
-        speaker: SpeakerPlayback | None,
+        translated_audio_queue: asyncio.Queue[TranslatedUtterance | None] | None,
     ) -> None:
         while True:
             utterance = await utterance_queue.get()
             if utterance is None:
+                if translated_audio_queue is not None:
+                    await translated_audio_queue.put(None)
+                utterance_queue.task_done()
                 return
 
             try:
@@ -540,15 +567,19 @@ class InterpreterApp:
                 translate_elapsed_ms = (time.monotonic() - translate_started) * 1000
                 self._emit_console_line("target", utterance.sequence_id, translated_text)
 
-                if tts is not None and speaker is not None:
-                    tts_metrics = await tts.stream_to_speaker(translated_text, speaker)
-                    LOGGER.info(
-                        "Latencies[%s]: translate=%.0fms tts_first_audio=%.0fms tts_total=%.0fms",
-                        utterance.sequence_id,
-                        translate_elapsed_ms,
-                        tts_metrics.first_audio_ms or -1.0,
-                        tts_metrics.total_ms,
+                if translated_audio_queue is not None:
+                    await translated_audio_queue.put(
+                        TranslatedUtterance(
+                            sequence_id=utterance.sequence_id,
+                            translated_text=translated_text,
+                            translate_elapsed_ms=translate_elapsed_ms,
+                        )
                     )
+                    if translated_audio_queue.qsize() >= 2:
+                        LOGGER.warning(
+                            "TTS playback queue backlog is %s utterances. Translated audio may lag.",
+                            translated_audio_queue.qsize(),
+                        )
                 else:
                     LOGGER.info(
                         "Latencies[%s]: translate=%.0fms",
@@ -557,11 +588,40 @@ class InterpreterApp:
                     )
             except Exception:
                 LOGGER.exception(
-                    "Failed while processing utterance %s.",
+                    "Failed while translating utterance %s.",
                     utterance.sequence_id,
                 )
             finally:
                 utterance_queue.task_done()
+
+    async def _translated_audio_playback_worker(
+        self,
+        translated_audio_queue: asyncio.Queue[TranslatedUtterance | None],
+        tts: OpenAITTSService,
+        speaker: SpeakerPlayback,
+    ) -> None:
+        while True:
+            utterance = await translated_audio_queue.get()
+            if utterance is None:
+                translated_audio_queue.task_done()
+                return
+
+            try:
+                tts_metrics = await tts.stream_to_speaker(utterance.translated_text, speaker)
+                LOGGER.info(
+                    "Latencies[%s]: translate=%.0fms tts_first_audio=%.0fms tts_total=%.0fms",
+                    utterance.sequence_id,
+                    utterance.translate_elapsed_ms,
+                    tts_metrics.first_audio_ms or -1.0,
+                    tts_metrics.total_ms,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "Failed while playing translated audio for utterance %s.",
+                    utterance.sequence_id,
+                )
+            finally:
+                translated_audio_queue.task_done()
 
     def _normalize_transcript_fragment(self, text: str) -> str:
         return " ".join(text.split()).strip()
